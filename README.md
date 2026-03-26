@@ -33,24 +33,73 @@ DO0 sinks to GND when active (NPN output, max 1A per channel). Use an external r
 
 ### Prerequisites
 
-- Python 3.12 (the Fairino SDK requires Cython for build; Python 3.14 is not yet supported)
+- **Python 3.12** (the Fairino SDK's Cython build and binary dependencies do not support Python 3.14 yet)
 - Network connection to the FR5 controller (default IP: `192.168.57.2`)
+- Git (to clone the repo)
 
-### Setup
+### Clone the Repository
+
+```bash
+git clone https://github.com/Nitish05/hikvision-integration.git
+cd hikvision-integration
+```
+
+### Linux Setup
 
 ```bash
 # Create virtual environment with Python 3.12
 python3.12 -m venv .venv
+
+# Activate the virtual environment
 source .venv/bin/activate
 
-# Install dependencies
+# Install Python dependencies
 pip install -r requirements.txt
 
-# Install the Fairino SDK (included in this repo)
+# Install the Fairino SDK
+# Option A: Editable install (requires Cython)
+pip install cython
 pip install -e ./fairino
-# If editable install fails due to Cython, install Cython first:
-# pip install cython && pip install -e ./fairino
-# Or simply run the apps from this directory - the SDK is importable from the fairino/ folder
+
+# Option B: If Option A fails, just run apps from the project root
+# The SDK is importable directly from the fairino/ folder without installing
+```
+
+### Windows Setup
+
+```powershell
+# Create virtual environment with Python 3.12
+py -3.12 -m venv .venv
+
+# Activate the virtual environment
+.venv\Scripts\activate
+
+# Install Python dependencies
+pip install -r requirements.txt
+
+# Install the Fairino SDK
+# Option A: Editable install (requires Cython and MSVC compiler)
+pip install cython
+pip install -e ./fairino
+
+# Option B: Standard install with MSVC compiler
+# Open "Developer Command Prompt for Visual Studio" first, then:
+cd fairino
+python setup.py build_ext --inplace --compiler=msvc
+cd ..
+
+# Option C: If builds fail, just run apps from the project root
+# The SDK is importable directly from the fairino/ folder without installing
+```
+
+### Verify Installation
+
+```bash
+# Test that the SDK imports correctly
+python -c "from fairino import Robot; print('SDK OK')"
+
+# Test connection to the robot (robot must be powered on and networked)
+python -c "from fairino import Robot; r = Robot.RPC('192.168.57.2'); print(r.GetSDKVersion())"
 ```
 
 ## SDK Modifications
