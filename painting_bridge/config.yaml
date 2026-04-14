@@ -1,0 +1,30 @@
+serial:
+  port: auto              # "auto" or explicit path like /dev/ttyACM0
+  baud: 115200
+  read_timeout_s: 0.05
+
+robot:
+  ip: 192.168.57.2         # this robot's actual IP (SDK default is 192.168.58.2)
+  use_servoj: true         # true=ServoJ+IK (recorder.py's proven path), false=ServoCart (hit err=112)
+  cmd_period_s: 0.010      # declared cmdT — matches CYCLETIME in recorder.py
+  loop_period_s: 0.010     # host loop target, match cmd_period_s
+  filter_t: 0.0            # docstring says "not yet released"; keep 0
+  pos_gain: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+
+mapping:
+  scale_xyz: 1.0          # 1:1 handle mm -> TCP mm
+  scale_rot: 1.0          # 1:1 handle deg -> TCP deg
+
+safety:
+  max_delta_mm_per_cycle: 2.5      # 250 mm/s ceiling @ 100 Hz
+  max_delta_deg_per_cycle: 1.25    # 125 deg/s ceiling
+  workspace_box_mm: [250.0, 250.0, 250.0]  # +/- AABB around tcp_start
+  workspace_rot_deg: [90.0, 90.0, 90.0]
+  workspace_reach_radius_mm: 300.0  # spherical gate (diagonal of the box)
+  stream_timeout_ms: 50             # reader-silence watchdog
+  trilat_recover_samples: 2         # clean samples needed after a trilat fail
+  ik_fail_cooldown_ms: 200          # min ms between IK-fail / reach-gate warnings
+
+filter:
+  ema_alpha_xyz: 0.35     # 1.0 disables filtering
+  ema_alpha_rot: 1.0      # BNO055 is already fused; keep raw
