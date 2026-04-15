@@ -34,6 +34,7 @@ class HandleSample:
     seq: int                       # monotonic sample counter
     trilat_ok: bool                # False if firmware reported a fresh trilat failure
     rezero: bool = False           # True if this sample coincided with a rezero event
+    button: Optional[bool] = None  # last-known switch state, None = never reported
 
 
 def autodetect_teensy() -> Optional[str]:
@@ -73,6 +74,7 @@ class TeensyReader(threading.Thread):
         self._partial = {}                  # key -> float, cleared after a full sample
         self._trilat_fail_last = 0
         self._trilat_fail_pending = False   # a failure happened since last emission
+        self._button_state: Optional[bool] = None  # last observed switch state
 
     def stop(self) -> None:
         self._stop_evt.set()
@@ -135,6 +137,13 @@ class TeensyReader(threading.Thread):
                     self._trilat_fail_last = n
                 continue
 
+            if key == "button":
+                try:
+                    self._button_state = bool(int(float(val)))
+                except ValueError:
+                    pass
+                continue
+
             if key not in POSE_KEYS:
                 continue
             try:
@@ -153,6 +162,7 @@ class TeensyReader(threading.Thread):
                     seq=self._seq,
                     trilat_ok=not self._trilat_fail_pending,
                     rezero=rezero_pending,
+                    button=self._button_state,
                 )
                 self._trilat_fail_pending = False
                 rezero_pending = False

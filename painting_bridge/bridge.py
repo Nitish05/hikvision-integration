@@ -122,6 +122,9 @@ def run(cfg: dict, dry_run: bool, port_override: Optional[str]) -> int:
             "workspace_reach_radius_mm", min(box_mm)))
         ik_cooldown_s = float(cfg["safety"].get(
             "ik_fail_cooldown_ms", 200)) / 1000.0
+        sol_cfg = cfg.get("solenoid", {}) or {}
+        sol_enabled = bool(sol_cfg.get("enabled", True))
+        sol_do_id = int(sol_cfg.get("do_id", 0))
 
         last_target = list(tcp_start)
         filtered = list(first.pose)
@@ -130,6 +133,7 @@ def run(cfg: dict, dry_run: bool, port_override: Optional[str]) -> int:
         trilat_clean_streak = trilat_need
         n_sent = n_skipped = n_clamped = n_ik_fail = n_hold = 0
         t_last_ik_warn = 0.0
+        last_do_state: Optional[bool] = None      # edge tracker for solenoid
         t_next = time.perf_counter() + cmd_period
         t_log = time.monotonic()
 
@@ -149,6 +153,19 @@ def run(cfg: dict, dry_run: bool, port_override: Optional[str]) -> int:
                 last_sample = s
             except queue.Empty:
                 pass
+
+            # Solenoid — edge-triggered. Always-on gate: run before any of the
+            # motion hold paths so the valve tracks the switch even while the
+            # arm is paused for trilat/IK/watchdog recovery.
+            if sol_enabled and last_sample.button is not None \
+                    and last_sample.button != last_do_state:
+                err_do = servo.set_do(sol_do_id, 1 if last_sample.button else 0)
+                if err_do == 0:
+                    last_do_state = last_sample.button
+                    log.info("solenoid -> %s", "ON" if last_sample.button else "OFF")
+                else:
+                    log.warning("SetDO err=%s (target=%s)", err_do,
+                                int(bool(last_sample.button)))
 
             # Stream-loss watchdog: hold position, treat next sample as new anchor.
             if time.monotonic() - last_sample.t_mono > stream_timeout_s:
@@ -237,14 +254,25 @@ def run(cfg: dict, dry_run: bool, port_override: Optional[str]) -> int:
             # Periodic stats (1 Hz).
             if time.monotonic() - t_log > 1.0:
                 t_log = time.monotonic()
-                log.info("sent=%d skipped=%d clamped=%d ik_fail=%d hold=%d target=%s",
+                log.info("sent=%d skipped=%d clamped=%d ik_fail=%d hold=%d "
+                         "retry_ok=%d retry_fail=%d target=%s",
                          n_sent, n_skipped, n_clamped, n_ik_fail, n_hold,
+                         servo.ik_retry_ok, servo.ik_retry_fail,
                          [round(v, 2) for v in target])
 
     except Exception as e:
         log.exception("fatal: %s", e)
         exit_code = 1
     finally:
+        # Best-effort close the solenoid so the valve doesn't hang open if the
+        # process exits with the switch held. Uses configured do_id (defaults
+        # to 0) so it works even if preflight never ran.
+        try:
+            _sol_cfg = (cfg.get("solenoid") or {})
+            if _sol_cfg.get("enabled", True):
+                servo.set_do(int(_sol_cfg.get("do_id", 0)), 0)
+        except Exception:
+            pass
         try:
             servo.emergency_stop()
         except Exception:

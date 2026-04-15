@@ -30,6 +30,7 @@ class RobotProto(Protocol):
     def RobotEnable(self, state: int) -> int: ...
     def StopMotion(self) -> int: ...
     def ResetAllError(self) -> int: ...
+    def SetDO(self, id: int, status: int, smooth: int = 0, block: int = 0) -> int: ...
 
 
 class MockRobot:
@@ -65,6 +66,9 @@ class MockRobot:
         self._n_cart += 1
         return 0
     def connect_to_robot(self): return 0
+    def SetDO(self, id, status, smooth=0, block=0):
+        log.info("[mock] SetDO(id=%d, status=%d)", int(id), int(status))
+        return 0
     def StopMotion(self):
         log.info("[mock] StopMotion")
         self._in_servo = False
@@ -123,6 +127,8 @@ class FR5Servo:
         self.use_servoj = use_servoj
         self._in_servo = False
         self._joint_ref: Optional[list] = None  # IK warm-start / ServoJ last cmd
+        self.ik_retry_ok = 0      # fresh-joint retry rescued a failed IK
+        self.ik_retry_fail = 0    # both attempts failed — target really unreachable
         self.robot: RobotProto
 
         if dry_run:
@@ -187,6 +193,11 @@ class FR5Servo:
             log.error("StopMotion failed: %s", e)
         self.end()
 
+    def set_do(self, do_id: int, status: int) -> int:
+        """Thin SetDO passthrough. Edge-triggered from the bridge's button
+        state tracker. Blocking call (~5 ms). Do not put in servo hot path."""
+        return self.robot.SetDO(int(do_id), int(status), 0, 0)
+
     # Non-fatal sentinel returned by send() when the IK step fails. The
     # bridge loop treats this like a trilat-fail: hold pose, log, resume.
     IK_FAIL = -112
@@ -212,8 +223,27 @@ class FR5Servo:
             self._joint_ref = list(joints)
         err, jp = self.robot.GetInverseKinRef(0, target, self._joint_ref)
         if err != 0 or jp is None:
-            # IK failure is recoverable — caller will hold position.
-            return self.IK_FAIL
+            # First attempt failed. Our reference may be stale (arm reconfigured
+            # since last successful command). Retry once with actual joints.
+            err_j, fresh = self.robot.GetActualJointPosDegree()
+            if err_j == 0 and fresh is not None:
+                err, jp = self.robot.GetInverseKinRef(0, target, list(fresh))
+                if err == 0 and jp is not None:
+                    self.ik_retry_ok += 1
+                    try:
+                        delta_ref = max(abs(a - b) for a, b in
+                                        zip(self._joint_ref, fresh))
+                        log.debug("IK retry with fresh joints succeeded "
+                                  "(delta_ref=%.2f deg)", delta_ref)
+                    except Exception:
+                        pass
+                    self._joint_ref = list(fresh)  # anchor future IK to fresh
+                else:
+                    self.ik_retry_fail += 1
+                    return self.IK_FAIL
+            else:
+                self.ik_retry_fail += 1
+                return self.IK_FAIL
         rc = self.robot.ServoJ(jp, [0.0, 0.0, 0.0, 0.0], 0.0, 0.0,
                                self.cmd_period_s, 0.0, 0.0)
         if rc == 0:

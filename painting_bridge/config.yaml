@@ -28,3 +28,7 @@ safety:
 filter:
   ema_alpha_xyz: 0.35     # 1.0 disables filtering
   ema_alpha_rot: 1.0      # BNO055 is already fused; keep raw
+
+solenoid:
+  enabled: true           # false = ignore button events, solenoid never fires
+  do_id: 0                # FR5 DO channel the solenoid is wired to (DO0)
