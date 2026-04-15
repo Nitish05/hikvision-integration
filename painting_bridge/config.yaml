@@ -13,14 +13,14 @@ robot:
 
 mapping:
   scale_xyz: 1.0          # 1:1 handle mm -> TCP mm
-  scale_rot: 1.0          # 1:1 handle deg -> TCP deg
+  scale_rot: 0.65          # 1:1 handle deg -> TCP deg
 
 safety:
   max_delta_mm_per_cycle: 2.5      # 250 mm/s ceiling @ 100 Hz
   max_delta_deg_per_cycle: 1.25    # 125 deg/s ceiling
-  workspace_box_mm: [250.0, 250.0, 250.0]  # +/- AABB around tcp_start
+  workspace_box_mm: [400.0, 400.0, 400.0]  # +/- AABB around tcp_start
   workspace_rot_deg: [90.0, 90.0, 90.0]
-  workspace_reach_radius_mm: 300.0  # spherical gate (diagonal of the box)
+  workspace_reach_radius_mm: 500.0  # spherical gate (diagonal of the box)
   stream_timeout_ms: 50             # reader-silence watchdog
   trilat_recover_samples: 2         # clean samples needed after a trilat fail
   ik_fail_cooldown_ms: 200          # min ms between IK-fail / reach-gate warnings
@@ -32,3 +32,10 @@ filter:
 solenoid:
   enabled: true           # false = ignore button events, solenoid never fires
   do_id: 0                # FR5 DO channel the solenoid is wired to (DO0)
+
+recording:
+  enabled: true           # enables the 'r' hotkey; false disables entirely
+  period_s: 0.010         # sampling period (100 Hz). 0.008 matches recorder.py CYCLETIME
+  dir: "./recordings"     # auto-created on first 'r'
+  filename_prefix: "run"  # files become run_YYYYMMDD_HHMMSS.txt
+  tool: 0                 # written into the file header; matches recorder.py TOOL

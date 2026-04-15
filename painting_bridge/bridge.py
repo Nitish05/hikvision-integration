@@ -19,6 +19,7 @@ import os
 import queue
 import signal
 import sys
+import threading
 import time
 from typing import Optional
 
@@ -26,6 +27,7 @@ import yaml
 
 from teensy_reader import HandleSample, TeensyReader, resolve_port
 from fr5_servo import FR5Servo  # noqa: F401 — FR5Servo.IK_FAIL used below
+from recording import TrajectoryRecorder
 from safety import (
     check_reach,
     clamp_delta,
@@ -43,6 +45,19 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 def load_config(path: str) -> dict:
     with open(path, "r") as f:
         return yaml.safe_load(f)
+
+
+def _stdin_reader(q: "queue.Queue[str]") -> None:
+    """Blocking readline loop in a daemon thread. 'r' + Enter toggles the
+    recorder; 'q' + Enter is reserved for future shutdown hotkey. Silently
+    exits on EOF (non-TTY invocation like nohup/systemd)."""
+    try:
+        for line in sys.stdin:
+            tok = line.strip().lower()
+            if tok == "r":
+                q.put("toggle")
+    except Exception:
+        pass
 
 
 def _wait_for_clean_sample(q: "queue.Queue[HandleSample]",
@@ -126,6 +141,22 @@ def run(cfg: dict, dry_run: bool, port_override: Optional[str]) -> int:
         sol_enabled = bool(sol_cfg.get("enabled", True))
         sol_do_id = int(sol_cfg.get("do_id", 0))
 
+        rec_cfg = cfg.get("recording", {}) or {}
+        rec_enabled = bool(rec_cfg.get("enabled", False))
+        recorder: Optional[TrajectoryRecorder] = None
+        tok_q: "queue.Queue[str]" = queue.Queue()
+        if rec_enabled:
+            recorder = TrajectoryRecorder(
+                servo=servo,
+                period_s=float(rec_cfg.get("period_s", cmd_period)),
+                out_dir=rec_cfg.get("dir", "./recordings"),
+                filename_prefix=rec_cfg.get("filename_prefix", "run"),
+                tool=int(rec_cfg.get("tool", 0)),
+            )
+            threading.Thread(
+                target=_stdin_reader, args=(tok_q,), daemon=True).start()
+            log.info("recording ready — press 'r' + Enter to toggle")
+
         last_target = list(tcp_start)
         filtered = list(first.pose)
         last_sample: HandleSample = first
@@ -154,6 +185,19 @@ def run(cfg: dict, dry_run: bool, port_override: Optional[str]) -> int:
             except queue.Empty:
                 pass
 
+            # Recorder hotkey: drain any pending 'r' toggles.
+            if recorder is not None:
+                try:
+                    while True:
+                        tok = tok_q.get_nowait()
+                        if tok == "toggle":
+                            if recorder.is_recording():
+                                recorder.stop()
+                            else:
+                                recorder.start()
+                except queue.Empty:
+                    pass
+
             # Solenoid — edge-triggered. Always-on gate: run before any of the
             # motion hold paths so the valve tracks the switch even while the
             # arm is paused for trilat/IK/watchdog recovery.
@@ -162,6 +206,7 @@ def run(cfg: dict, dry_run: bool, port_override: Optional[str]) -> int:
                 err_do = servo.set_do(sol_do_id, 1 if last_sample.button else 0)
                 if err_do == 0:
                     last_do_state = last_sample.button
+                    servo.last_do_state = bool(last_sample.button)
                     log.info("solenoid -> %s", "ON" if last_sample.button else "OFF")
                 else:
                     log.warning("SetDO err=%s (target=%s)", err_do,
@@ -213,8 +258,7 @@ def run(cfg: dict, dry_run: bool, port_override: Optional[str]) -> int:
             for i in range(3, 6):
                 target[i] = tcp_start[i] + scale_rot * (filtered[i] - handle_ref[i])
 
-            # Normalize unwrapped angles from firmware, then clamp.
-            target = normalize_orientation(target, tcp_start)
+            # Clamp the continuous targets.
             pre_clamp = list(target)
             target = clamp_workspace(target, tcp_start, box_mm, box_rot)
             target = clamp_delta(target, last_target, max_dmm, max_ddeg)
@@ -232,7 +276,11 @@ def run(cfg: dict, dry_run: bool, port_override: Optional[str]) -> int:
                                 [round(v, 2) for v in target[:3]], reach_radius)
                 continue
 
-            err = servo.send(target)
+            # normalize_orientation is applied LAST, only here. All clamps
+            # above run in continuous-angle space; wrapping earlier would
+            # break clamp_workspace (wrong range) and clamp_delta (340 deg
+            # spurious jumps across the ±180 seam).
+            err = servo.send(normalize_orientation(target))
             if err == FR5Servo.IK_FAIL:
                 n_ik_fail += 1
                 n_hold += 1
@@ -264,6 +312,13 @@ def run(cfg: dict, dry_run: bool, port_override: Optional[str]) -> int:
         log.exception("fatal: %s", e)
         exit_code = 1
     finally:
+        # Finalize recorder first so the file header's N is correct even if
+        # the shutdown path raises below.
+        try:
+            if 'recorder' in locals() and recorder is not None:
+                recorder.stop()
+        except Exception:
+            pass
         # Best-effort close the solenoid so the valve doesn't hang open if the
         # process exits with the switch held. Uses configured do_id (defaults
         # to 0) so it works even if preflight never ran.

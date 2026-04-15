@@ -76,11 +76,19 @@ def test_wrap_deg_range():
 
 
 def test_normalize_orientation_unwraps_large_continuous_angle():
-    # Firmware rollCont can exceed 360; expect wrapped delta around anchor.
-    anchor = [0, 0, 0, 10, 0, 0]
-    tgt = [0, 0, 0, 10 + 725, 0, 0]  # 725 deg == 5 deg
-    out = normalize_orientation(tgt, anchor)
+    # Target absolute orientation is wrapped to [-180, 180].
+    tgt = [0, 0, 0, 10 + 725, 0, 0]  # 735 deg == 15 deg
+    out = normalize_orientation(tgt)
     assert math.isclose(out[3], 15.0, abs_tol=1e-6)
+
+
+def test_normalize_orientation_wraps_values_across_seam():
+    # Boundary case: a continuously composed target near the +180 seam.
+    # Example: tcp_start_rz=170 plus handle rotation yields target rz=195,
+    # which is the same physical orientation as rz=-165 for the FR5 IK.
+    tgt = [0, 0, 0, 0, 0, 195.0]
+    out = normalize_orientation(tgt)
+    assert math.isclose(out[5], -165.0, abs_tol=1e-6)
 
 
 def test_check_reach_at_anchor():

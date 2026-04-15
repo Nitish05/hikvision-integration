@@ -75,12 +75,11 @@ def wrap_deg(angle: float) -> float:
     return a
 
 
-def normalize_orientation(target: Pose, anchor: Pose) -> Pose:
-    """Rewrite target[3:6] as anchor + wrapped_delta so unwrapped firmware
-    angles (rollCont/yawCont can exceed +/-180) don't confuse the IK."""
+def normalize_orientation(target: Pose) -> Pose:
+    """Wrap target[3:6] to [-180, 180] so angles don't confuse the IK."""
     out = list(target)
     for i in range(3, 6):
-        out[i] = anchor[i] + wrap_deg(target[i] - anchor[i])
+        out[i] = wrap_deg(target[i])
     return out
 
 

@@ -129,6 +129,10 @@ class FR5Servo:
         self._joint_ref: Optional[list] = None  # IK warm-start / ServoJ last cmd
         self.ik_retry_ok = 0      # fresh-joint retry rescued a failed IK
         self.ik_retry_fail = 0    # both attempts failed — target really unreachable
+        # Mirror of the last successfully commanded DO0 state. Updated by the
+        # bridge on every successful SetDO so the trajectory recorder thread
+        # can read it without cross-thread coordination.
+        self.last_do_state: bool = False
         self.robot: RobotProto
 
         if dry_run:
