@@ -116,19 +116,28 @@ def _import_real_rpc():
 class FR5Servo:
     def __init__(self, ip: str, cmd_period_s: float, pos_gain: Pose,
                  filter_t: float, dry_run: bool = False,
-                 use_servoj: bool = True):
+                 use_servoj: bool = True,
+                 max_joint_delta_deg: Optional[float] = None):
         """use_servoj: stream via ServoJ (joint-space, with per-cycle IK).
         Matches the proven pattern in recorder.py. ServoCart has been
-        observed to reject motion with err=112 on this controller."""
+        observed to reject motion with err=112 on this controller.
+
+        max_joint_delta_deg: per-cycle, per-joint clamp applied to the IK
+        output before ServoJ. Catches IK branch flips and wrist-singularity
+        blow-ups (the cause of FR5 'Shaft collision fault' alarms in
+        streaming). None disables."""
         self.cmd_period_s = cmd_period_s
         self.pos_gain = pos_gain
         self.filter_t = filter_t
         self.dry_run = dry_run
         self.use_servoj = use_servoj
+        self.max_joint_delta_deg = max_joint_delta_deg
         self._in_servo = False
         self._joint_ref: Optional[list] = None  # IK warm-start / ServoJ last cmd
         self.ik_retry_ok = 0      # fresh-joint retry rescued a failed IK
         self.ik_retry_fail = 0    # both attempts failed — target really unreachable
+        self.joint_clamped = 0    # cycles where joint-space clamp fired
+        self._t_last_jclamp_warn = 0.0
         # Mirror of the last successfully commanded DO0 state. Updated by the
         # bridge on every successful SetDO so the trajectory recorder thread
         # can read it without cross-thread coordination.
@@ -248,6 +257,35 @@ class FR5Servo:
             else:
                 self.ik_retry_fail += 1
                 return self.IK_FAIL
+        # Joint-space delta clamp. Hard guard against IK branch flips and
+        # wrist-singularity blow-ups that the Cartesian clamps can't see.
+        if (self.max_joint_delta_deg is not None
+                and self._joint_ref is not None):
+            limit = self.max_joint_delta_deg
+            clamped_any = False
+            jp_clamped = list(jp)
+            worst_axis = -1
+            worst_d = 0.0
+            for i in range(len(jp_clamped)):
+                d = jp_clamped[i] - self._joint_ref[i]
+                if d > limit:
+                    jp_clamped[i] = self._joint_ref[i] + limit
+                    clamped_any = True
+                elif d < -limit:
+                    jp_clamped[i] = self._joint_ref[i] - limit
+                    clamped_any = True
+                if abs(d) > abs(worst_d):
+                    worst_d = d
+                    worst_axis = i
+            if clamped_any:
+                self.joint_clamped += 1
+                now_m = time.monotonic()
+                if now_m - self._t_last_jclamp_warn >= 0.5:
+                    self._t_last_jclamp_warn = now_m
+                    log.warning("joint clamp: J%d delta=%.2f deg (limit %.2f) "
+                                "— IK flip or singularity",
+                                worst_axis + 1, worst_d, limit)
+            jp = jp_clamped
         rc = self.robot.ServoJ(jp, [0.0, 0.0, 0.0, 0.0], 0.0, 0.0,
                                self.cmd_period_s, 0.0, 0.0)
         if rc == 0:

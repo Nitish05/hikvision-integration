@@ -36,6 +36,14 @@ from safety import (
     is_finite,
     normalize_orientation,
 )
+from geometry import (
+    R_inv,
+    R_mul,
+    R_to_rpy_xyz_deg_continuous,
+    quat_to_R,
+    rpy_xyz_deg_to_R,
+    scale_axis_angle,
+)
 
 log = logging.getLogger("bridge")
 
@@ -99,6 +107,7 @@ def run(cfg: dict, dry_run: bool, port_override: Optional[str]) -> int:
         filter_t=cfg["robot"]["filter_t"],
         dry_run=dry_run,
         use_servoj=cfg["robot"].get("use_servoj", True),
+        max_joint_delta_deg=cfg["safety"].get("max_joint_delta_deg_per_cycle"),
     )
 
     # --- Graceful shutdown plumbing ---
@@ -125,6 +134,9 @@ def run(cfg: dict, dry_run: bool, port_override: Optional[str]) -> int:
         cmd_period = cfg["robot"].get("loop_period_s", cfg["robot"]["cmd_period_s"])
         scale_xyz = cfg["mapping"]["scale_xyz"]
         scale_rot = cfg["mapping"]["scale_rot"]
+        imu_mount_rpy = cfg["mapping"].get("imu_mount_rpy_deg", [0.0, 0.0, 0.0])
+        R_im2base = rpy_xyz_deg_to_R(imu_mount_rpy)
+        R_im2base_inv = R_inv(R_im2base)
         a_xyz = cfg["filter"]["ema_alpha_xyz"]
         a_rot = cfg["filter"]["ema_alpha_rot"]
         max_dmm = cfg["safety"]["max_delta_mm_per_cycle"]
@@ -160,6 +172,14 @@ def run(cfg: dict, dry_run: bool, port_override: Optional[str]) -> int:
         last_target = list(tcp_start)
         filtered = list(first.pose)
         last_sample: HandleSample = first
+        # Quaternion-based rotation reference. None when firmware is the legacy
+        # build that doesn't emit qw/qx/qy/qz (bridge then falls back to the
+        # Euler-additive path).
+        R_handle_ref = quat_to_R(*first.quat) if first.quat is not None else None
+        # Continuous-angle reference for decomposition. Tracks the unclamped
+        # target's RPY so the next decomposition picks the same Euler branch
+        # and clamp_delta never sees a 360 deg seam jump.
+        last_rpy_continuous = list(tcp_start[3:6])
         last_servo_sample_seq = -1
         trilat_clean_streak = trilat_need
         n_sent = n_skipped = n_clamped = n_ik_fail = n_hold = 0
@@ -242,6 +262,9 @@ def run(cfg: dict, dry_run: bool, port_override: Optional[str]) -> int:
                 handle_ref = list(last_sample.pose)
                 filtered = list(last_sample.pose)
                 last_target = list(tcp_start)
+                R_handle_ref = (quat_to_R(*last_sample.quat)
+                                if last_sample.quat is not None else None)
+                last_rpy_continuous = list(tcp_start[3:6])
                 last_servo_sample_seq = last_sample.seq
                 log.info("re-anchored at seq=%d tcp=%s",
                          last_sample.seq, [round(v, 3) for v in tcp_start])
@@ -255,8 +278,31 @@ def run(cfg: dict, dry_run: bool, port_override: Optional[str]) -> int:
             target = [0.0] * 6
             for i in range(3):
                 target[i] = tcp_start[i] + scale_xyz * (filtered[i] - handle_ref[i])
-            for i in range(3, 6):
-                target[i] = tcp_start[i] + scale_rot * (filtered[i] - handle_ref[i])
+
+            if last_sample.quat is not None and R_handle_ref is not None:
+                # Proper rotation composition. The handle's relative rotation
+                # since 'z' is qRel = qRef^-1 * qCurrent (firmware already does
+                # this; we recompute on the bridge to be robust against any
+                # firmware reset while we hold a stale R_handle_ref).
+                R_handle_now = quat_to_R(*last_sample.quat)
+                R_rel_imu = R_mul(R_inv(R_handle_ref), R_handle_now)
+                # Express the handle's rotation in the FR5 base frame via the
+                # configured IMU mounting transform (similarity).
+                R_rel_base = R_mul(R_mul(R_im2base, R_rel_imu), R_im2base_inv)
+                if scale_rot != 1.0:
+                    R_rel_base = scale_axis_angle(R_rel_base, scale_rot)
+                R_tcp_start = rpy_xyz_deg_to_R(tcp_start[3:6])
+                R_tcp_target = R_mul(R_rel_base, R_tcp_start)
+                target[3:6] = R_to_rpy_xyz_deg_continuous(
+                    R_tcp_target, last_rpy_continuous)
+                # Track the unclamped continuous decomposition so the next
+                # cycle's branch selection is stable across the +/-180 seam.
+                last_rpy_continuous = list(target[3:6])
+            else:
+                # Legacy fallback: Euler addition. Only correct near identity;
+                # used when firmware predates the qw/qx/qy/qz emission.
+                for i in range(3, 6):
+                    target[i] = tcp_start[i] + scale_rot * (filtered[i] - handle_ref[i])
 
             # Clamp the continuous targets.
             pre_clamp = list(target)
@@ -303,9 +349,10 @@ def run(cfg: dict, dry_run: bool, port_override: Optional[str]) -> int:
             if time.monotonic() - t_log > 1.0:
                 t_log = time.monotonic()
                 log.info("sent=%d skipped=%d clamped=%d ik_fail=%d hold=%d "
-                         "retry_ok=%d retry_fail=%d target=%s",
+                         "retry_ok=%d retry_fail=%d j_clamp=%d target=%s",
                          n_sent, n_skipped, n_clamped, n_ik_fail, n_hold,
                          servo.ik_retry_ok, servo.ik_retry_fail,
+                         servo.joint_clamped,
                          [round(v, 2) for v in target])
 
     except Exception as e:

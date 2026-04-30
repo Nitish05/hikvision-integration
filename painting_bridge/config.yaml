@@ -12,12 +12,24 @@ robot:
   pos_gain: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
 
 mapping:
-  scale_xyz: 1.0          # 1:1 handle mm -> TCP mm
-  scale_rot: 0.65          # 1:1 handle deg -> TCP deg
+  scale_xyz: 1.0     # 1:1 handle mm -> TCP mm
+  scale_rot: 0.1         # axis-angle scale for handle->TCP rotation
+  # IMU chip frame -> FR5 base frame (similarity transform applied to the
+  # relative handle rotation before composing with TCP start). Tune in 90 deg
+  # steps via dry-run: rotate the handle pure-roll about its own X and watch
+  # which target axis moves. Common values: [0,0,0], [180,0,0], [0,0,90],
+  # [0,0,-90]. Requires firmware that emits qw/qx/qy/qz; old firmware falls
+  # back to Euler-additive composition and ignores this.
+  imu_mount_rpy_deg: [0, 0, 0]
 
 safety:
   max_delta_mm_per_cycle: 2.5      # 250 mm/s ceiling @ 100 Hz
   max_delta_deg_per_cycle: 1.25    # 125 deg/s ceiling
+  # Joint-space rate limit applied AFTER IK, before ServoJ. Catches IK branch
+  # flips and wrist-singularity blow-ups that the Cartesian clamps can't see —
+  # these are what trip "Shaft collision fault" on the FR5. 0.5 deg/cycle @
+  # 100 Hz = 50 deg/s per joint. null disables.
+  max_joint_delta_deg_per_cycle: 0.5
   workspace_box_mm: [400.0, 400.0, 400.0]  # +/- AABB around tcp_start
   workspace_rot_deg: [90.0, 90.0, 90.0]
   workspace_reach_radius_mm: 500.0  # spherical gate (diagonal of the box)
@@ -26,7 +38,7 @@ safety:
   ik_fail_cooldown_ms: 200          # min ms between IK-fail / reach-gate warnings
 
 filter:
-  ema_alpha_xyz: 0.35     # 1.0 disables filtering
+  ema_alpha_xyz: 1.0     # 1.0 disables filtering
   ema_alpha_rot: 1.0      # BNO055 is already fused; keep raw
 
 solenoid:

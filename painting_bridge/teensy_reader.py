@@ -13,7 +13,7 @@ import queue
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Tuple
 
 import serial
 
@@ -25,6 +25,10 @@ TEENSY_VID_SUBSTR = "16C0"
 # Order matches main.cpp Serial.print order. A sample is "complete" once we
 # have seen all six pose keys since the last emission.
 POSE_KEYS = ("x", "y", "z", "rx", "ry", "rz")
+# Optional relative-rotation quaternion (qRef^-1 * qCurrent), emitted by
+# firmware after the Euler lines. When all four are present the bridge uses
+# proper rotation composition; if absent it falls back to Euler addition.
+QUAT_KEYS = ("qw", "qx", "qy", "qz")
 
 
 @dataclass
@@ -35,6 +39,7 @@ class HandleSample:
     trilat_ok: bool                # False if firmware reported a fresh trilat failure
     rezero: bool = False           # True if this sample coincided with a rezero event
     button: Optional[bool] = None  # last-known switch state, None = never reported
+    quat: Optional[Tuple[float, float, float, float]] = None  # (w,x,y,z) relative quat
 
 
 def autodetect_teensy() -> Optional[str]:
@@ -72,6 +77,7 @@ class TeensyReader(threading.Thread):
         self._ser: Optional[serial.Serial] = None
         self._seq = 0
         self._partial = {}                  # key -> float, cleared after a full sample
+        self._partial_q = {}                # quat keys, cleared with _partial
         self._trilat_fail_last = 0
         self._trilat_fail_pending = False   # a failure happened since last emission
         self._button_state: Optional[bool] = None  # last observed switch state
@@ -144,6 +150,13 @@ class TeensyReader(threading.Thread):
                     pass
                 continue
 
+            if key in QUAT_KEYS:
+                try:
+                    self._partial_q[key] = float(val)
+                except ValueError:
+                    pass
+                continue
+
             if key not in POSE_KEYS:
                 continue
             try:
@@ -151,10 +164,16 @@ class TeensyReader(threading.Thread):
             except ValueError:
                 continue
 
-            # Emit when all 6 keys are present.
+            # Emit when all 6 pose keys are present. Quat is attached only if
+            # all 4 quat keys arrived since the last emission (graceful fallback
+            # for old firmware that doesn't emit them).
             if len(self._partial) == 6 and all(k in self._partial for k in POSE_KEYS):
                 pose = [self._partial[k] for k in POSE_KEYS]
+                quat: Optional[Tuple[float, float, float, float]] = None
+                if all(k in self._partial_q for k in QUAT_KEYS):
+                    quat = tuple(self._partial_q[k] for k in QUAT_KEYS)  # type: ignore[assignment]
                 self._partial.clear()
+                self._partial_q.clear()
                 self._seq += 1
                 sample = HandleSample(
                     t_mono=time.monotonic(),
@@ -163,6 +182,7 @@ class TeensyReader(threading.Thread):
                     trilat_ok=not self._trilat_fail_pending,
                     rezero=rezero_pending,
                     button=self._button_state,
+                    quat=quat,
                 )
                 self._trilat_fail_pending = False
                 rezero_pending = False
