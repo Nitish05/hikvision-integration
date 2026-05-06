@@ -30,11 +30,23 @@ from fr5_servo import FR5Servo  # noqa: F401 — FR5Servo.IK_FAIL used below
 from recording import TrajectoryRecorder
 from safety import (
     check_reach,
-    clamp_delta,
-    clamp_workspace,
-    ema,
+    clamp_pos_box,
+    clamp_pos_delta,
+    ema_pos,
     is_finite,
-    normalize_orientation,
+)
+from quat import (
+    IDENTITY,
+    is_finite_q,
+    quat_clamp_box,
+    quat_clamp_delta,
+    quat_conj,
+    quat_from_zyx_deg,
+    quat_mul,
+    quat_normalize,
+    quat_scale_angle,
+    quat_slerp,
+    quat_to_zyx_deg,
 )
 
 log = logging.getLogger("bridge")
@@ -71,7 +83,7 @@ def _wait_for_clean_sample(q: "queue.Queue[HandleSample]",
         except queue.Empty:
             continue
         last = s
-        if s.trilat_ok and is_finite(s.pose):
+        if s.trilat_ok and is_finite(s.pos) and is_finite_q(s.q_rel):
             return s
     if last is None:
         raise RuntimeError("no sample from Teensy within 5 s")
@@ -115,10 +127,18 @@ def run(cfg: dict, dry_run: bool, port_override: Optional[str]) -> int:
     try:
         tcp_start = servo.preflight()
         first = _wait_for_clean_sample(sample_q)
-        handle_ref = list(first.pose)
-        log.info("anchored: tcp_start=%s handle_ref=%s",
+        # Anchor: snapshot TCP pose and handle pose at this moment. Rotations
+        # are mapped body-frame at TCP — handle delta from anchor (in handle
+        # body frame) is applied to the TCP starting from its anchor pose.
+        # The user implicitly defines the handle↔brush axis correspondence by
+        # how they hold the handle when this snapshot is taken.
+        q_tcp_anchor = quat_normalize(quat_from_zyx_deg(*tcp_start[3:6]))
+        q_handle_anchor = quat_normalize(first.q_rel)
+        handle_ref_pos = list(first.pos)
+        log.info("anchored: tcp_start=%s handle_pos=%s q_handle=%s",
                  [round(v, 3) for v in tcp_start],
-                 [round(v, 3) for v in handle_ref])
+                 [round(v, 3) for v in handle_ref_pos],
+                 [round(v, 4) for v in q_handle_anchor])
 
         servo.begin()
 
@@ -130,7 +150,9 @@ def run(cfg: dict, dry_run: bool, port_override: Optional[str]) -> int:
         max_dmm = cfg["safety"]["max_delta_mm_per_cycle"]
         max_ddeg = cfg["safety"]["max_delta_deg_per_cycle"]
         box_mm = cfg["safety"]["workspace_box_mm"]
-        box_rot = cfg["safety"]["workspace_rot_deg"]
+        # Quat-aware workspace clamp uses a single scalar geodesic radius —
+        # max of the per-axis Euler limits is the natural reduction.
+        box_rot_radius_deg = float(max(cfg["safety"]["workspace_rot_deg"]))
         stream_timeout_s = cfg["safety"]["stream_timeout_ms"] / 1000.0
         trilat_need = int(cfg["safety"]["trilat_recover_samples"])
         reach_radius = float(cfg["safety"].get(
@@ -157,8 +179,10 @@ def run(cfg: dict, dry_run: bool, port_override: Optional[str]) -> int:
                 target=_stdin_reader, args=(tok_q,), daemon=True).start()
             log.info("recording ready — press 'r' + Enter to toggle")
 
-        last_target = list(tcp_start)
-        filtered = list(first.pose)
+        last_target_pos = list(tcp_start[:3])
+        last_target_q = q_tcp_anchor
+        filtered_pos = list(first.pos)
+        filtered_q = q_handle_anchor
         last_sample: HandleSample = first
         last_servo_sample_seq = -1
         trilat_clean_streak = trilat_need
@@ -225,7 +249,8 @@ def run(cfg: dict, dry_run: bool, port_override: Optional[str]) -> int:
                 continue
 
             # Trilat recovery gate.
-            if not last_sample.trilat_ok or not is_finite(last_sample.pose):
+            if not last_sample.trilat_ok or not is_finite(last_sample.pos) \
+                    or not is_finite_q(last_sample.q_rel):
                 trilat_clean_streak = 0
                 n_hold += 1
                 continue
@@ -239,48 +264,73 @@ def run(cfg: dict, dry_run: bool, port_override: Optional[str]) -> int:
                 err, tcp_now = servo.robot.GetActualTCPPose()
                 if err == 0 and is_finite(tcp_now):
                     tcp_start = list(tcp_now)
-                handle_ref = list(last_sample.pose)
-                filtered = list(last_sample.pose)
-                last_target = list(tcp_start)
+                q_tcp_anchor = quat_normalize(quat_from_zyx_deg(*tcp_start[3:6]))
+                q_handle_anchor = quat_normalize(last_sample.q_rel)
+                handle_ref_pos = list(last_sample.pos)
+                filtered_pos = list(last_sample.pos)
+                filtered_q = q_handle_anchor
+                last_target_pos = list(tcp_start[:3])
+                last_target_q = q_tcp_anchor
                 last_servo_sample_seq = last_sample.seq
                 log.info("re-anchored at seq=%d tcp=%s",
                          last_sample.seq, [round(v, 3) for v in tcp_start])
                 continue
             last_servo_sample_seq = last_sample.seq
 
-            # Host-side EMA filter.
-            filtered = ema(filtered, last_sample.pose, a_xyz, a_rot)
+            # Host-side filtering — EMA on position, slerp on rotation.
+            filtered_pos = ema_pos(filtered_pos, last_sample.pos, a_xyz)
+            filtered_q = quat_normalize(
+                quat_slerp(filtered_q, last_sample.q_rel, a_rot))
 
-            # Compose absolute target in base frame.
-            target = [0.0] * 6
-            for i in range(3):
-                target[i] = tcp_start[i] + scale_xyz * (filtered[i] - handle_ref[i])
-            for i in range(3, 6):
-                target[i] = tcp_start[i] + scale_rot * (filtered[i] - handle_ref[i])
+            # Position target — base-frame XYZ offsets from anchor.
+            target_pos = [tcp_start[i]
+                          + scale_xyz * (filtered_pos[i] - handle_ref_pos[i])
+                          for i in range(3)]
 
-            # Clamp the continuous targets.
-            pre_clamp = list(target)
-            target = clamp_workspace(target, tcp_start, box_mm, box_rot)
-            target = clamp_delta(target, last_target, max_dmm, max_ddeg)
-            if target != pre_clamp:
+            # Rotation target — body-frame composition AT the TCP.
+            # q_handle_delta is the rotation the handle has done since anchor,
+            # expressed in handle body axes at anchor. We apply the (scaled)
+            # same rotation to the TCP body axes at anchor: q_target =
+            # q_tcp_anchor · scale(q_handle_delta). Implicit assumption: the
+            # operator's grip at anchor establishes handle-axes ↔ TCP-axes
+            # correspondence (twist handle around its long axis ↔ twist brush
+            # around its long axis, etc.).
+            q_handle_delta = quat_mul(quat_conj(q_handle_anchor), filtered_q)
+            # Invert rotation direction about handle X and Z (robot was mirroring
+            # operator twist/yaw); pitch about Y stays as-is.
+            q_handle_delta = (q_handle_delta[0], -q_handle_delta[1],
+                              q_handle_delta[2], -q_handle_delta[3])
+            q_handle_delta = quat_scale_angle(q_handle_delta, scale_rot)
+            q_target = quat_normalize(quat_mul(q_tcp_anchor, q_handle_delta))
+
+            # Clamps — position per-axis box + delta, rotation geodesic
+            # box + delta. Quat clamps reject the ±180 seam aliasing that
+            # killed the old Euler clamps.
+            pos_pre = list(target_pos)
+            target_pos = clamp_pos_box(target_pos, tcp_start[:3], box_mm)
+            target_pos = clamp_pos_delta(target_pos, last_target_pos, max_dmm)
+            q_pre = q_target
+            q_target = quat_clamp_box(q_target, q_tcp_anchor, box_rot_radius_deg)
+            q_target = quat_clamp_delta(q_target, last_target_q, max_ddeg)
+            if pos_pre != target_pos or q_pre != q_target:
                 n_clamped += 1
 
             # Spherical reach gate — catches diagonal excursions the box misses
             # and keeps obviously-unsolvable targets from reaching the IK.
-            if not check_reach(target, tcp_start, reach_radius):
+            if not check_reach(target_pos, tcp_start[:3], reach_radius):
                 n_hold += 1
                 now_m = time.monotonic()
                 if now_m - t_last_ik_warn >= ik_cooldown_s:
                     t_last_ik_warn = now_m
                     log.warning("reach gate: target %s outside %.1f mm of anchor — holding",
-                                [round(v, 2) for v in target[:3]], reach_radius)
+                                [round(v, 2) for v in target_pos], reach_radius)
                 continue
 
-            # normalize_orientation is applied LAST, only here. All clamps
-            # above run in continuous-angle space; wrapping earlier would
-            # break clamp_workspace (wrong range) and clamp_delta (340 deg
-            # spurious jumps across the ±180 seam).
-            err = servo.send(normalize_orientation(target))
+            # Quat → Tait-Bryan only at the FR5 boundary. quat_to_zyx_deg
+            # returns rx,rz in (-180,180] and ry in [-90,90], which is exactly
+            # what GetInverseKinRef accepts — no normalize_orientation needed.
+            target = list(target_pos) + list(quat_to_zyx_deg(q_target))
+            err = servo.send(target)
             if err == FR5Servo.IK_FAIL:
                 n_ik_fail += 1
                 n_hold += 1
@@ -296,7 +346,8 @@ def run(cfg: dict, dry_run: bool, port_override: Optional[str]) -> int:
                 stop_flag["stop"] = True
                 exit_code = 2
                 break
-            last_target = target
+            last_target_pos = target_pos
+            last_target_q = q_target
             n_sent += 1
 
             # Periodic stats (1 Hz).

@@ -23,14 +23,17 @@ log = logging.getLogger(__name__)
 TEENSY_VID_SUBSTR = "16C0"
 
 # Order matches main.cpp Serial.print order. A sample is "complete" once we
-# have seen all six pose keys since the last emission.
-POSE_KEYS = ("x", "y", "z", "rx", "ry", "rz")
+# have seen all required keys since the last emission.
+POS_KEYS = ("x", "y", "z")
+QUAT_KEYS = ("qw", "qx", "qy", "qz")
+SAMPLE_KEYS = POS_KEYS + QUAT_KEYS
 
 
 @dataclass
 class HandleSample:
     t_mono: float                  # host monotonic timestamp (s)
-    pose: list                     # [x, y, z, rx, ry, rz]
+    pos: list                      # [x, y, z] handle position in world frame (mm)
+    q_rel: list                    # [w, x, y, z] qRel = qRef^-1 * qCurrent
     seq: int                       # monotonic sample counter
     trilat_ok: bool                # False if firmware reported a fresh trilat failure
     rezero: bool = False           # True if this sample coincided with a rezero event
@@ -144,21 +147,23 @@ class TeensyReader(threading.Thread):
                     pass
                 continue
 
-            if key not in POSE_KEYS:
+            if key not in SAMPLE_KEYS:
                 continue
             try:
                 self._partial[key] = float(val)
             except ValueError:
                 continue
 
-            # Emit when all 6 keys are present.
-            if len(self._partial) == 6 and all(k in self._partial for k in POSE_KEYS):
-                pose = [self._partial[k] for k in POSE_KEYS]
+            # Emit when xyz + quaternion are all present.
+            if all(k in self._partial for k in SAMPLE_KEYS):
+                pos = [self._partial[k] for k in POS_KEYS]
+                q_rel = [self._partial[k] for k in QUAT_KEYS]
                 self._partial.clear()
                 self._seq += 1
                 sample = HandleSample(
                     t_mono=time.monotonic(),
-                    pose=pose,
+                    pos=pos,
+                    q_rel=q_rel,
                     seq=self._seq,
                     trilat_ok=not self._trilat_fail_pending,
                     rezero=rezero_pending,

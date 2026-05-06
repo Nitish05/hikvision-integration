@@ -87,11 +87,11 @@ static inline void quatToEulerDeg(double w, double x, double y, double z,
 // Three-sphere intersection: solve |P - Ai|^2 = Li^2 for i=1,2,3.
 // Anchor placeholders — replace with surveyed world-frame coordinates (mm).
 struct Vec3 { double x, y, z; };
-// Anchor triangle side lengths (mm): |A1-A2|=110, |A2-A3|=100, |A3-A1|=102.
+// Anchor triangle side lengths (mm): |A1-A2|=251, |A2-A3|=308, |A3-A1|=310.
 // Coordinates below place the triangle in z=0 with its centroid at the origin.
-constexpr Vec3 ANCHOR1 = {-55.612, -28.232,   0.0};
-constexpr Vec3 ANCHOR2 = { 54.388, -28.232,   0.0};
-constexpr Vec3 ANCHOR3 = {  1.224,  56.465,   0.0};
+constexpr Vec3 ANCHOR1 = { +126.321,  -94.120,   0.0};   // right
+constexpr Vec3 ANCHOR2 = { -124.679,  -94.120,   0.0};   // left
+constexpr Vec3 ANCHOR3 = {   -1.641, +188.240,   0.0};   // front
 // Zero-reference position of the handle when the user presses 'z'.
 constexpr Vec3 P0 = {  0.0,   0.0,    85.0};
 
@@ -291,9 +291,19 @@ void loop() {
   Serial.print(">x:");  Serial.println(pos.x, 2);
   Serial.print(">y:");  Serial.println(pos.y, 2);
   Serial.print(">z:");  Serial.println(pos.z, 2);
+  // Telemetry-only Tait-Bryan (rx=roll about world X, ry=pitch about world Y,
+  // rz=yaw about world Z) at zero pose IMU body axes match world: X=right,
+  // Y=front, Z=up. Bridge consumes the qw/qx/qy/qz lines below; the rx/ry/rz
+  // emits exist for Teleplot debugging.
   Serial.print(">rx:"); Serial.println(rollCont, 2);
   Serial.print(">ry:"); Serial.println(pitch, 2);
   Serial.print(">rz:"); Serial.println(yawCont, 2);
+  // qRel = qRef^-1 * qCurrent — body-frame rotation from zero pose to now.
+  // Bridge composes this onto q_tcp_anchor for body-frame TCP rotation.
+  Serial.print(">qw:"); Serial.println(cw, 6);
+  Serial.print(">qx:"); Serial.println(cx, 6);
+  Serial.print(">qy:"); Serial.println(cy, 6);
+  Serial.print(">qz:"); Serial.println(cz, 6);
   Serial.print(">dt_ms:"); Serial.println(dt);
 
   static uint32_t lastFailPrint = 0;
