@@ -104,6 +104,7 @@ static inline Vec3   vcross(const Vec3 &a, const Vec3 &b) {
 }
 static inline double vnorm(const Vec3 &a) { return sqrt(vdot(a, a)); }
 
+
 // Baselines (string lengths at P0) populated on captureZero().
 static double L1_baseline = 0, L2_baseline = 0, L3_baseline = 0;
 static Vec3 lastPose = P0;
