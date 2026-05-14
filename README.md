@@ -1,5 +1,7 @@
 # Fairino FR5 Painting Rig
 
+> **New here?** Start with [`HANDOFF.md`](HANDOFF.md) — the two-machine cold-start workflow (Linux records, Windows plays back). This README is the reference manual that document leans on.
+
 A hand-held painting handle (Teensy 4.1 + BNO055 IMU + 3× draw-wire encoders) teleoperates a **Fairino FR5** cobot in real time. The operator paints by hand; the arm mirrors the motion with a paint-valve solenoid driven from a handle-mounted switch. Trajectories can be recorded during a session and replayed autonomously on subsequent parts.
 
 Target hardware: **Fairino FR5** cobot (controller FRC100-AC, firmware V3.8.7-QX) + **Teensy 4.1** handle + painting solenoid wired to FR5 DO0.
@@ -260,20 +262,23 @@ Fields: six joints (deg), six Cartesian (mm/deg), FRTYPE=5 (FR5), trigger=DO0 st
 
 ### Playback options
 
-| Method | Timing | Upload required? | Use case |
+| Method | Timing | Host OS | Use case |
 |---|---|---|---|
-| `recorder.py` → **Play (Servo+DO)** | Host-paced ~100 Hz | no | Quick dev retest |
-| `recorder.py` → **Play (TPD)** | Controller-native, exact | yes — `TrajectoryJUpLoad` | Production painting runs |
+| **`hikvision.py` → Load → Start** (TPD on controller) | Controller-native, exact | **Windows only — see [`HANDOFF.md`](HANDOFF.md)** | **Production painting runs** |
+| `recorder.py` → **Play (TPD)** | Controller-native, exact | Either (recorder.py is the drag-teach GUI) | Dev replay of a drag-teach recording |
+| `recorder.py` → **Play (Servo+DO)** | Host-paced ~100 Hz | Either (best-effort) | Quick dev retest, not for production |
 
-For TPD exact-timing playback:
+> **Hard rule:** `hikvision.py` is run **only from Windows**. Linux runs have caused unsafe FR5 motion (see [`HANDOFF.md`](HANDOFF.md#why-playback-from-linux-is-forbidden)). The bridge — i.e. recording — is Linux-side and stays Linux-side. Don't mix them.
+
+For TPD exact-timing playback via SDK (instead of the GUI):
 ```python
 from fairino import Robot
 r = Robot.RPC('192.168.57.2')
 r.TrajectoryJUpLoad(filePath='./recordings/run_20260415_143000.txt')
-# Then use recorder.py GUI → Load → Play (TPD)
+# Then either use the hikvision.py GUI (Windows) or recorder.py → Load → Play (TPD).
 ```
 
-See **[painting_bridge/README.md](painting_bridge/README.md)** for in-depth bridge docs and the [full file-format spec](painting_bridge/README.md#using-it).
+See **[painting_bridge/README.md](painting_bridge/README.md)** for in-depth bridge docs and the [full file-format spec](painting_bridge/README.md#using-it). See **[`HANDOFF.md`](HANDOFF.md)** for the end-to-end record-on-Linux / play-on-Windows workflow.
 
 ---
 
@@ -289,8 +294,12 @@ See **[painting_bridge/README.md](painting_bridge/README.md)** for in-depth brid
 | `mapping.scale_xyz` | `1.0` | 1:1 handle mm → TCP mm |
 | `mapping.scale_rot` | `1.0` | Set to `0` for translation-only teleop (avoids wrist singularities) |
 | `safety.max_delta_mm_per_cycle` | `2.5` | 250 mm/s ceiling at 100 Hz |
-| `safety.workspace_box_mm` | `[250,250,250]` | Axis-aligned cube around `tcp_start` |
-| `safety.workspace_reach_radius_mm` | `300` | Spherical reach gate |
+| `safety.max_delta_deg_per_cycle` | `1.25` | 125 deg/s ceiling at 100 Hz |
+| `safety.workspace_box_mm` | `[400, 400, 400]` | Axis-aligned cube (± per axis) around `tcp_start` |
+| `safety.workspace_rot_deg` | `[90, 90, 90]` | Per-axis rotation envelope around the anchor orientation |
+| `safety.workspace_reach_radius_mm` | `500` | Spherical reach gate |
+| `safety.stream_timeout_ms` | `50` | Reader-silence watchdog |
+| `safety.trilat_recover_samples` | `2` | Clean samples required after a trilat fail |
 | `filter.ema_alpha_xyz` | `0.35` | Lower = more smoothing / more lag |
 | `solenoid.enabled` | `true` | Disable to ignore button entirely |
 | `solenoid.do_id` | `0` | FR5 DO channel |
