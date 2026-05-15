@@ -3,6 +3,10 @@ serial:
   baud: 115200
   read_timeout_s: 0.05
 
+quest:
+  controller: right        # right, left, or first tracked controller
+  wait_timeout_s: 60.0     # extra time for SteamVR/OpenVR to publish poses
+
 robot:
   ip: 192.168.57.2         # this robot's actual IP (SDK default is 192.168.58.2)
   use_servoj: true         # true=ServoJ+IK (recorder.py's proven path), false=ServoCart (hit err=112)

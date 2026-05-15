@@ -6,6 +6,17 @@ A hand-held painting handle (Teensy 4.1 + BNO055 IMU + 3× draw-wire encoders) t
 
 Target hardware: **Fairino FR5** cobot (controller FRC100-AC, firmware V3.8.7-QX) + **Teensy 4.1** handle + painting solenoid wired to FR5 DO0.
 
+Current bridge input sources:
+
+- **Teensy handle**: serial Teleplot stream from the physical painting handle.
+- **Quest controller**: OpenVR pose stream using `+X` right, `+Y` away from the headset reference, and `+Z` up. The Quest trigger maps to the paint/solenoid button. Holding `B` or `Y` pauses motion; releasing it re-anchors control from that release pose.
+
+Both sources are treated as **input deltas**. The robot target is always based on the FR5 TCP pose captured at anchor time:
+
+```
+robot_target = robot_tcp_at_anchor + scale * input_delta_from_source_anchor
+```
+
 ```
    ┌──────────────────────┐    USB     ┌───────────────┐  Ethernet   ┌─────────────┐
    │ Teensy 4.1 handle    │───────────▶│ Host bridge   │────────────▶│ FR5 cobot   │
@@ -37,6 +48,11 @@ hikvision_integration/
 ├── requirements.txt            Python deps
 └── recordings/                 Bridge output (auto-created; gitignored)
 ```
+
+Additional current bridge files not shown in older diagrams:
+
+- `painting_bridge/quest_reader.py`: OpenVR / Quest controller input source for `bridge.py`.
+- `quest.py`: standalone Quest/OpenVR viewport and coordinate debugger.
 
 ---
 
@@ -86,13 +102,18 @@ Three CALT CESI-S2000 draw-wire encoders, 2000 PPR × 4× quadrature = 8000 coun
 - **Python 3.12** (the Fairino SDK's Cython build doesn't yet support 3.14+)
 - Linux or Windows with git
 - PlatformIO for firmware builds (via VS Code extension or `pip install platformio`)
+- Optional but useful on fresh Windows machines: [`uv`](https://docs.astral.sh/uv/) for creating a Python 3.12 venv when `python` / `py` is not on PATH.
 
 ### Clone + venv
 
 ```bash
 git clone https://github.com/Nitish05/hikvision-integration.git
 cd hikvision-integration
+```
 
+If Python 3.12 is already installed and on PATH, create the venv normally:
+
+```bash
 # Linux
 python3.12 -m venv .venv
 source .venv/bin/activate
@@ -102,11 +123,42 @@ py -3.12 -m venv .venv
 .venv\Scripts\activate
 ```
 
+If Windows does not recognize `python`, `python3`, or `py`, use `uv` to create a self-contained Python 3.12 venv in the repo:
+
+```powershell
+# From the repo root
+$env:UV_CACHE_DIR=".uv-cache"
+$env:UV_PYTHON_INSTALL_DIR=".uv-python"
+
+uv venv --managed-python --python 3.12 .venv
+.\.venv\Scripts\python.exe -m ensurepip --upgrade
+.\.venv\Scripts\activate
+```
+
+The `UV_CACHE_DIR` and `UV_PYTHON_INSTALL_DIR` lines keep uv's generated files inside the repo. They are ignored by `.gitignore`.
+
 ### Python dependencies
 
 ```bash
 pip install -r requirements.txt
 pip install pyserial pyyaml   # for painting_bridge
+pip install pygame openvr     # for Quest/OpenVR source and quest.py viewport
+```
+
+If you created the venv with `uv`, you can install everything without relying on `pip` first:
+
+```powershell
+$env:UV_CACHE_DIR=".uv-cache"
+$env:UV_PYTHON_INSTALL_DIR=".uv-python"
+uv pip install --python .venv\Scripts\python.exe -r requirements.txt pyserial pyyaml pygame openvr
+.\.venv\Scripts\python.exe -m ensurepip --upgrade
+```
+
+Verify the install:
+
+```bash
+python -c "import numpy, matplotlib, serial, yaml, pygame, openvr; print('imports ok')"
+python -m py_compile quest.py painting_bridge/bridge.py
 ```
 
 ### Install the Fairino SDK
@@ -199,6 +251,31 @@ cd painting_bridge
 python bridge.py
 ```
 
+When `--source` is omitted, `bridge.py` asks at runtime:
+
+```text
+Select control source:
+  1. Teensy handle
+  2. Quest controller
+Press Enter for Teensy.
+>
+```
+
+You can also bypass the prompt:
+
+```bash
+python bridge.py --source teensy
+python bridge.py --source quest
+python bridge.py --dry-run --source quest
+```
+
+Windows PowerShell examples:
+
+```powershell
+.\.venv\Scripts\python.exe .\painting_bridge\bridge.py --dry-run
+.\.venv\Scripts\python.exe .\painting_bridge\bridge.py --dry-run --source quest
+```
+
 **Pre-flight checklist:**
 1. **E-stop within reach.** Always.
 2. Move the arm to a joint-mid-range pose via the pendant (J1~0°, J2~−60°, J3~90°, J4~0°, J5~90°, J6~0°). Avoid any joint within 10° of its limit — this alone eliminates most IK failures.
@@ -228,11 +305,27 @@ sent=99 skipped=0 clamped=0 ik_fail=0 hold=0 retry_ok=0 retry_fail=0 target=[...
 
 ### Solenoid trigger
 
-Press the handle's pin-6 switch → `SetDO(0, 1)`. Release → `SetDO(0, 0)`. Edge-triggered, not per-cycle. Valve closes automatically on `Ctrl-C`.
+Press the handle's pin-6 switch or the Quest trigger -> `SetDO(0, 1)`. Release -> `SetDO(0, 0)`. Edge-triggered, not per-cycle. Valve closes automatically on `Ctrl-C`.
 
 ### Re-anchoring mid-session
 
 Press `z` on the Teensy serial console → firmware emits `>rezero:1` → bridge re-captures `tcp_start = current TCP` and `handle_ref = current handle pose` atomically. The arm doesn't move; handle→arm mapping is recentered.
+
+### Quest source behavior
+
+Use `--source quest` or choose `2` from the startup menu. SteamVR/OpenVR must be running, and the headset plus selected controller must be awake and tracked.
+
+The Quest coordinate frame matches `quest.py`:
+
+| Axis | Meaning |
+|---|---|
+| `+X` | right from the headset reference |
+| `+Y` | away/forward from the headset reference |
+| `+Z` | up |
+
+The first valid headset pose locks the frame, and the first selected-controller pose becomes the controller anchor. The bridge receives only controller deltas from that anchor, then adds those deltas to the robot TCP anchor. It does not send raw Quest world coordinates to the robot.
+
+Quest trigger maps to the bridge button/solenoid. Holding `B` or `Y` pauses motion; moving the controller while held does not move the robot. Releasing `B` or `Y` re-anchors the controller and robot TCP at the release pose, so control resumes without a catch-up move.
 
 ### Shutdown
 
@@ -268,7 +361,7 @@ Fields: six joints (deg), six Cartesian (mm/deg), FRTYPE=5 (FR5), trigger=DO0 st
 | `recorder.py` → **Play (TPD)** | Controller-native, exact | Either (recorder.py is the drag-teach GUI) | Dev replay of a drag-teach recording |
 | `recorder.py` → **Play (Servo+DO)** | Host-paced ~100 Hz | Either (best-effort) | Quick dev retest, not for production |
 
-> **Hard rule:** `hikvision.py` is run **only from Windows**. Linux runs have caused unsafe FR5 motion (see [`HANDOFF.md`](HANDOFF.md#why-playback-from-linux-is-forbidden)). The bridge — i.e. recording — is Linux-side and stays Linux-side. Don't mix them.
+> **Hard rule:** `hikvision.py` playback is run **only from Windows**. Linux playback runs have caused unsafe FR5 motion (see [`HANDOFF.md`](HANDOFF.md#why-playback-from-linux-is-forbidden)). The bridge is the live teleop/recording path; keep production recording on the known-good host and do not substitute the Linux playback GUI path for it.
 
 For TPD exact-timing playback via SDK (instead of the GUI):
 ```python
@@ -286,7 +379,9 @@ See **[painting_bridge/README.md](painting_bridge/README.md)** for in-depth brid
 
 | Key | Default | Notes |
 |---|---|---|
-| `serial.port` | `auto` | Or explicit `/dev/ttyACM0` |
+| `serial.port` | `auto` | Auto-detects Teensy on Windows COM ports and Linux/macOS serial devices; explicit examples: `COM5`, `/dev/ttyACM0` |
+| `quest.controller` | `right` | Quest controller role: `right`, `left`, or `first` |
+| `quest.wait_timeout_s` | `60.0` | Startup wait for first clean Quest/OpenVR sample |
 | `robot.ip` | `192.168.57.2` | Override for different controllers |
 | `robot.use_servoj` | `true` | Use ServoJ+IK (proven); `false` reverts to ServoCart (hit err=112) |
 | `robot.cmd_period_s` | `0.010` | Declared cmdT; match loop_period_s |
@@ -312,7 +407,10 @@ See **[painting_bridge/README.md](painting_bridge/README.md)** for in-depth brid
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `No Teensy found` | Device not enumerated | `ls /dev/serial/by-id/`; plug in or pass `--serial` |
+| `No Teensy serial port found` | Device not enumerated | Check Device Manager or `ls /dev/serial/by-id/`; plug in or pass `--serial COM5` / `--serial /dev/ttyACM0` |
+| `no sample from quest within ...` | SteamVR/OpenVR is not publishing tracked poses | Open SteamVR, wake headset and controller, verify `quest.py` shows the controller |
+| `waiting for Quest headset pose from OpenVR` | Headset not awake/tracked | Wake headset and confirm SteamVR tracking |
+| `waiting for Quest controller pose from OpenVR` | Controller asleep, wrong hand selected, or not tracked | Wake controller; set `quest.controller` to `left`, `right`, or `first` |
 | `SDK连接机器人实时端口失败 [Errno 113] No route to host` | Ethernet not on 192.168.57.0/24 | Verify `ip route get 192.168.57.2`; bring up the `fr5` NM connection |
 | `err=-4` on every RPC | Network timeout (bad route / firewall / robot off) | `ping 192.168.57.2` must succeed before anything else |
 | `ServoCart err=112` / `ServoJ err=112` | IK solver can't find a solution | Non-fatal; bridge holds. Re-home arm to joint-mid-range pose; set `scale_rot: 0` for first runs |

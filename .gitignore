@@ -1,4 +1,7 @@
 .venv/
+.uv-cache/
+.uv-python/
+.matplotlib-cache/
 __pycache__/
 *.pyc
 *.pyo

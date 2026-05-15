@@ -4,6 +4,13 @@ Two-machine operational guide. **Record on Linux. Play back on Windows.** No exc
 
 For the full system manual see `README.md`. For bridge internals see `painting_bridge/README.md`. This document is the workflow narrative that ties the two together.
 
+Current bridge input sources:
+
+- **Teensy handle**: the original USB serial painting handle.
+- **Quest controller**: OpenVR controller pose source. Quest trigger maps to the paint button. Holding `B` or `Y` pauses motion; releasing it re-anchors control from that release pose.
+
+The bridge asks for the source at runtime unless `--source teensy` or `--source quest` is supplied.
+
 ---
 
 ## TL;DR — the topology
@@ -36,8 +43,10 @@ For the full system manual see `README.md`. For bridge internals see `painting_b
 
 | Thing | Path | Notes |
 |---|---|---|
-| Bridge entry (Linux) | `painting_bridge/bridge.py` | argparse: `--config`, `--serial`, `--dry-run`, `--log-level` |
-| Bridge config | `painting_bridge/config.yaml` | Scales, safety limits, robot IP, recording period |
+| Bridge entry | `painting_bridge/bridge.py` | argparse: `--config`, `--serial`, `--source teensy\|quest`, `--dry-run`, `--log-level`; prompts for source if omitted |
+| Bridge config | `painting_bridge/config.yaml` | Serial, Quest, scales, safety limits, robot IP, recording period |
+| Quest source | `painting_bridge/quest_reader.py` | OpenVR input source; publishes controller deltas, not raw Quest coordinates |
+| Quest viewport/debugger | `quest.py` | Standalone OpenVR coordinate viewport; same `+X right`, `+Y away`, `+Z up` convention |
 | Recordings output | `painting_bridge/recordings/run_YYYYMMDD_HHMMSS.txt` | Auto-created; gitignored |
 | Recording format spec | `painting_bridge/recording.py:33–47` | Header `N,1,period_ms,tool,diconfig,doconfig`; rows `j1..j6,x,y,z,rx,ry,rz,5,trigger,17` |
 | Linux venv | `.venv/bin/python` | Python 3.12.13; `fairino`, `pyserial==3.5`, `pyyaml==6.0.3`, `numpy`, `matplotlib` |
@@ -64,6 +73,7 @@ source .venv/bin/activate
 # 2. python deps
 pip install -r requirements.txt
 pip install pyserial pyyaml
+pip install pygame openvr # optional: Quest source / quest.py viewport on this host
 
 # 3. Fairino SDK — Option A (editable) or B (direct import from ./fairino, which
 #    is what bridge.py does by default). Option B is fine; Option A only if you
@@ -73,6 +83,21 @@ pip install -e ./fairino   # optional
 
 # 4. Verify SDK reaches the controller
 python -c "from fairino import Robot; r = Robot.RPC('192.168.57.2'); print(r.GetSDKVersion())"
+```
+
+If `python3.12` is not installed, install Python 3.12 with your distro/package manager first. If you use `uv` on Linux instead, the equivalent self-contained setup is:
+
+```bash
+git clone https://github.com/Nitish05/hikvision-integration.git
+cd hikvision-integration
+export UV_CACHE_DIR=.uv-cache
+export UV_PYTHON_INSTALL_DIR=.uv-python
+uv venv --managed-python --python 3.12 .venv
+source .venv/bin/activate
+uv pip install --python .venv/bin/python -r requirements.txt pyserial pyyaml pygame openvr
+python -m ensurepip --upgrade
+python -c "import numpy, matplotlib, serial, yaml, pygame, openvr; print('imports ok')"
+python -m py_compile quest.py painting_bridge/bridge.py
 ```
 
 **Network — persistent NM connection (one-time):**
@@ -111,6 +136,7 @@ py -3.12 -m venv .venv
 # 2. python deps
 pip install -r requirements.txt
 pip install pyserial pyyaml
+pip install pygame openvr # optional: Quest source / quest.py viewport on this host
 
 # 3. Fairino SDK — Option A is simpler on Windows because hikvision.py does
 #    `from fairino import Robot` unconditionally.
@@ -120,6 +146,24 @@ pip install -e .\fairino
 # 4. Verify
 python -c "from fairino import Robot; r = Robot.RPC('192.168.57.2'); print(r.GetSDKVersion())"
 ```
+
+If this is a fresh Windows machine and PowerShell says `py`, `python`, and `python3` are not recognized, use `uv` to create the venv with a managed Python 3.12:
+
+```powershell
+# From the repo root
+$env:UV_CACHE_DIR=".uv-cache"
+$env:UV_PYTHON_INSTALL_DIR=".uv-python"
+
+uv venv --managed-python --python 3.12 .venv
+.\.venv\Scripts\python.exe -m ensurepip --upgrade
+.\.venv\Scripts\activate
+
+uv pip install --python .venv\Scripts\python.exe -r requirements.txt pyserial pyyaml pygame openvr
+python -c "import numpy, matplotlib, serial, yaml, pygame, openvr; print('imports ok')"
+python -m py_compile quest.py painting_bridge\bridge.py
+```
+
+If uv reports cache or Python-install permission errors, keep these two environment variables set exactly as above. They force uv to use `.uv-cache/` and `.uv-python/` inside the repo; both are ignored by git.
 
 **Place `hikvision.py`.** The file is NOT in git (`.venv/` is gitignored). Get it from the Linux host's `.venv/hikvision.py` or from your backup, and put it somewhere convenient on the Windows machine — the venv root mirrors the Linux layout, but anywhere on PATH or in your working directory is fine.
 
@@ -147,13 +191,26 @@ cd painting_bridge
 python bridge.py
 ```
 
+If `--source` is omitted, the bridge asks:
+
+```text
+Select control source:
+  1. Teensy handle
+  2. Quest controller
+Press Enter for Teensy.
+>
+```
+
+Use `python bridge.py --source teensy` for the original handle, or `python bridge.py --source quest` for the Quest controller. `--dry-run` can be combined with either source.
+
 Flags (from `bridge.py:392–408`):
 
 | Flag | Purpose |
 |---|---|
 | `--config <path>` | Override default `painting_bridge/config.yaml` |
-| `--serial <dev>` | Override auto-detect, e.g. `/dev/ttyACM0` |
-| `--dry-run` | Use `MockRobot` — no controller needed, useful for sanity-checking the stream |
+| `--serial <dev>` | Override Teensy auto-detect, e.g. `COM5` or `/dev/ttyACM0` |
+| `--source teensy\|quest` | Bypass the runtime source menu |
+| `--dry-run` | Use `MockRobot` — no controller needed, useful for sanity-checking the selected source |
 | `--log-level DEBUG\|INFO\|WARNING\|ERROR` | Default `INFO` |
 
 **Expected startup log:**
@@ -166,6 +223,8 @@ preflight OK: tool_id=0 tcp=[...] joints=[...]
 anchored: tcp_start=[...] handle_ref=[...]
 sent=99 skipped=0 clamped=0 ik_fail=0 hold=0 retry_ok=0 retry_fail=0 target=[...]
 ```
+
+For Quest source, expected startup logs include `using quest controller source`, `quest source opened through OpenVR`, and `quest headset coordinate frame locked`. If SteamVR is not ready, the reader logs whether it is waiting for the headset pose or controller pose.
 
 **1 Hz stats line — what to watch:**
 
@@ -189,6 +248,8 @@ press   r   then Enter      → recorder stops
 The file lands at `painting_bridge/recordings/run_YYYYMMDD_HHMMSS.txt`. Format spec lives in `painting_bridge/recording.py:33–47`; header looks like `0000003318,1,10,0,1,1`, data rows have 15 comma-separated fields and end in `,5,<0-or-1>,17`.
 
 **Mid-session re-anchor:** press `z` on the Teensy serial console (`pio device monitor` or any serial terminal). Firmware emits `>rezero:1`, bridge atomically re-captures `tcp_start` and `handle_ref`. The arm doesn't move; the handle→arm mapping is recentered.
+
+**Quest mid-session re-anchor:** hold `B` or `Y` on either controller. While held, the bridge holds the robot and ignores controller movement. Move to the new neutral pose, then release `B`/`Y`; the Quest controller anchor and robot TCP anchor are refreshed together, so control resumes from the release pose without a catch-up move.
 
 **Shutdown:** `Ctrl-C`. Bridge runs `StopMotion → ServoMoveEnd → SetDO(0,0)` and exits cleanly.
 
@@ -272,6 +333,9 @@ Raise these only after you've confirmed the handle→arm direction is correct an
 | Symptom | Cause | Fix |
 |---|---|---|
 | Arm moves violently during playback | You are running `hikvision.py` from Linux | E-stop. Move playback to the Windows host. |
+| Quest source never anchors | SteamVR/OpenVR is not publishing headset/controller poses | Open SteamVR, wake headset and controller, verify `quest.py` viewport works. |
+| Quest source moves from an unexpected neutral pose | Controller anchor was captured in the wrong place | Hold `B`/`Y`, move to the desired neutral pose, release to re-anchor. |
+| `clamped` climbs constantly | Input delta is too large or too fast for safety limits | Lower `mapping.scale_xyz` / `mapping.scale_rot`, move slower, or re-anchor. |
 | Arm slow/wrong-speed on TPD playback | Recorded period (header `period_ms`) doesn't match expectation | Re-record with `recording.period_s: 0.010` in `config.yaml`, or set `recording.period_s: 0.008` to match `hikvision.py`'s `CYCLETIME` |
 | `hikvision.py` errors on Load with `Trajectory file ... uploaded` followed by RPC error | Filename has spaces or path separators the controller rejects | Rename to `run_YYYYMMDD_HHMMSS.txt` style (no spaces, no subdirs) |
 | `err=-4` from RPC on Windows | Routing / firewall — controller unreachable | `ping 192.168.57.2`; disable Windows Firewall on the wired profile or whitelist the Fairino ports |
@@ -286,6 +350,7 @@ Raise these only after you've confirmed the handle→arm direction is correct an
 source .venv/bin/activate
 cd painting_bridge
 python bridge.py
+# choose source from menu, or pass --source teensy / --source quest
 # 'r' Enter to start recording, 'r' Enter to stop, Ctrl-C to exit
 ```
 
@@ -310,7 +375,10 @@ python .venv\hikvision.py
 - `README.md` — system manual, hardware pinout, install
 - `painting_bridge/README.md` — bridge internals, safety invariants, troubleshooting
 - `painting_bridge/bridge.py` — bridge entry (argparse at `:392`)
+- `painting_bridge/quest_reader.py` — Quest/OpenVR source for bridge teleop
+- `painting_bridge/teensy_reader.py` — Teensy serial source with Windows/Linux auto-detect
 - `painting_bridge/config.yaml` — all tunables
+- `quest.py` — Quest controller coordinate viewport/debugger
 - `painting_bridge/recording.py` — trajectory file writer
 - `.venv/hikvision.py` — Windows playback GUI
 - `recorder.py` — separate GUI for drag-teach record/playback (alternative to the bridge for non-handle workflows)

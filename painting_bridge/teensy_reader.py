@@ -16,10 +16,12 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import serial
+from serial.tools import list_ports
 
 log = logging.getLogger(__name__)
 
 # Teensy USB VID. Any PID from PJRC works (Teensy 4.x enumerates as ACM).
+TEENSY_VID = 0x16C0
 TEENSY_VID_SUBSTR = "16C0"
 
 # Order matches main.cpp Serial.print order. A sample is "complete" once we
@@ -41,7 +43,32 @@ class HandleSample:
 
 
 def autodetect_teensy() -> Optional[str]:
-    """Return a /dev/serial/by-id/* path matching a Teensy, or None."""
+    """Return the first serial port that looks like a Teensy, or None.
+
+    PySerial's list_ports works on Windows (COMx), Linux, and macOS. Keep the
+    /dev/serial/by-id fallback because it gives stable Linux names on rigs that
+    expose a helpful by-id symlink.
+    """
+    candidates = []
+    for port in list_ports.comports():
+        text = " ".join(
+            str(value)
+            for value in (
+                port.device,
+                port.name,
+                port.description,
+                port.manufacturer,
+                port.product,
+                port.hwid,
+            )
+            if value
+        )
+        if port.vid == TEENSY_VID or "Teensy" in text or TEENSY_VID_SUBSTR in text.upper():
+            candidates.append(port.device)
+
+    if candidates:
+        return sorted(candidates)[0]
+
     for path in sorted(glob.glob("/dev/serial/by-id/*")):
         if TEENSY_VID_SUBSTR in path or "Teensy" in path:
             return path
@@ -54,7 +81,7 @@ def resolve_port(configured: str) -> str:
     p = autodetect_teensy()
     if p is None:
         raise RuntimeError(
-            "No Teensy found on /dev/serial/by-id/. Plug it in or pass --serial."
+            "No Teensy serial port found. Plug it in or pass --serial COMx."
         )
     return p
 

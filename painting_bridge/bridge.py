@@ -52,6 +52,8 @@ from quat import (
 log = logging.getLogger("bridge")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+SOURCE_TEENSY = "teensy"
+SOURCE_QUEST = "quest"
 
 
 def load_config(path: str) -> dict:
@@ -73,7 +75,8 @@ def _stdin_reader(q: "queue.Queue[str]") -> None:
 
 
 def _wait_for_clean_sample(q: "queue.Queue[HandleSample]",
-                           timeout_s: float = 5.0) -> HandleSample:
+                           timeout_s: float = 5.0,
+                           source: str = SOURCE_TEENSY) -> HandleSample:
     """Drain until we get a trilat-OK sample or time out."""
     t0 = time.monotonic()
     last: Optional[HandleSample] = None
@@ -86,22 +89,60 @@ def _wait_for_clean_sample(q: "queue.Queue[HandleSample]",
         if s.trilat_ok and is_finite(s.pos) and is_finite_q(s.q_rel):
             return s
     if last is None:
-        raise RuntimeError("no sample from Teensy within 5 s")
-    raise RuntimeError("no clean (trilat-OK) sample from Teensy within 5 s")
+        raise RuntimeError(f"no sample from {source} within 5 s")
+    raise RuntimeError(f"no clean sample from {source} within 5 s")
 
 
-def run(cfg: dict, dry_run: bool, port_override: Optional[str]) -> int:
-    # --- Setup serial + reader thread ---
-    port = resolve_port(port_override or cfg["serial"]["port"])
-    log.info("using serial port: %s", port)
-    sample_q: "queue.Queue[HandleSample]" = queue.Queue(maxsize=1)
-    reader = TeensyReader(
-        port=port,
-        baud=cfg["serial"]["baud"],
-        out_q=sample_q,
-        read_timeout_s=cfg["serial"]["read_timeout_s"],
-    )
+def _choose_source(source: Optional[str]) -> str:
+    if source:
+        return source
+    while True:
+        print()
+        print("Select control source:")
+        print("  1. Teensy handle")
+        print("  2. Quest controller")
+        print("Press Enter for Teensy.")
+        print("> ", end="", flush=True)
+        try:
+            choice = input().strip().lower()
+        except EOFError:
+            return SOURCE_TEENSY
+        if choice in ("", "1", "t", "teensy"):
+            return SOURCE_TEENSY
+        if choice in ("2", "q", "quest"):
+            return SOURCE_QUEST
+        print("Please choose 1 for Teensy or 2 for Quest.")
+
+
+def _start_reader(source: str, cfg: dict, port_override: Optional[str],
+                  sample_q: "queue.Queue[HandleSample]"):
+    if source == SOURCE_QUEST:
+        from quest_reader import QuestReader
+        reader = QuestReader(
+            out_q=sample_q,
+            controller_role=cfg.get("quest", {}).get("controller", "right"),
+        )
+        log.info("using quest controller source")
+    else:
+        port = resolve_port(port_override or cfg["serial"]["port"])
+        log.info("using serial port: %s", port)
+        reader = TeensyReader(
+            port=port,
+            baud=cfg["serial"]["baud"],
+            out_q=sample_q,
+            read_timeout_s=cfg["serial"]["read_timeout_s"],
+        )
     reader.start()
+    return reader
+
+
+def run(cfg: dict, dry_run: bool, port_override: Optional[str],
+        source: Optional[str]) -> int:
+    source = _choose_source(source)
+
+    # --- Setup input source + reader thread ---
+    sample_q: "queue.Queue[HandleSample]" = queue.Queue(maxsize=1)
+    reader = _start_reader(source, cfg, port_override, sample_q)
 
     # --- Setup robot ---
     servo = FR5Servo(
@@ -126,7 +167,16 @@ def run(cfg: dict, dry_run: bool, port_override: Optional[str]) -> int:
     exit_code = 0
     try:
         tcp_start = servo.preflight()
-        first = _wait_for_clean_sample(sample_q)
+        source_cfg = cfg.get(source, {}) or {}
+        first_timeout_s = float(source_cfg.get(
+            "wait_timeout_s",
+            60.0 if source == SOURCE_QUEST else 5.0,
+        ))
+        first = _wait_for_clean_sample(
+            sample_q,
+            timeout_s=first_timeout_s,
+            source=source,
+        )
         # Anchor: snapshot TCP pose and handle pose at this moment. Rotations
         # are mapped body-frame at TCP — handle delta from anchor (in handle
         # body frame) is applied to the TCP starting from its anchor pose.
@@ -186,6 +236,7 @@ def run(cfg: dict, dry_run: bool, port_override: Optional[str]) -> int:
         last_sample: HandleSample = first
         last_servo_sample_seq = -1
         trilat_clean_streak = trilat_need
+        pending_rezero = False
         n_sent = n_skipped = n_clamped = n_ik_fail = n_hold = 0
         t_last_ik_warn = 0.0
         last_do_state: Optional[bool] = None      # edge tracker for solenoid
@@ -248,6 +299,9 @@ def run(cfg: dict, dry_run: bool, port_override: Optional[str]) -> int:
             if last_sample.seq == last_servo_sample_seq:
                 continue
 
+            if last_sample.rezero:
+                pending_rezero = True
+
             # Trilat recovery gate.
             if not last_sample.trilat_ok or not is_finite(last_sample.pos) \
                     or not is_finite_q(last_sample.q_rel):
@@ -260,7 +314,7 @@ def run(cfg: dict, dry_run: bool, port_override: Optional[str]) -> int:
                 continue
 
             # Rezero: re-anchor without moving the robot.
-            if last_sample.rezero or last_servo_sample_seq == -1:
+            if pending_rezero or last_servo_sample_seq == -1:
                 err, tcp_now = servo.robot.GetActualTCPPose()
                 if err == 0 and is_finite(tcp_now):
                     tcp_start = list(tcp_now)
@@ -272,6 +326,7 @@ def run(cfg: dict, dry_run: bool, port_override: Optional[str]) -> int:
                 last_target_pos = list(tcp_start[:3])
                 last_target_q = q_tcp_anchor
                 last_servo_sample_seq = last_sample.seq
+                pending_rezero = False
                 log.info("re-anchored at seq=%d tcp=%s",
                          last_sample.seq, [round(v, 3) for v in tcp_start])
                 continue
@@ -394,6 +449,9 @@ def main() -> int:
     ap.add_argument("--config", default=os.path.join(HERE, "config.yaml"))
     ap.add_argument("--serial", default=None,
                     help="override serial port (default: config.yaml or auto)")
+    ap.add_argument("--source", choices=(SOURCE_TEENSY, SOURCE_QUEST),
+                    default=None,
+                    help="control source; omit to choose at launch")
     ap.add_argument("--dry-run", action="store_true",
                     help="use MockRobot instead of connecting to an FR5")
     ap.add_argument("--log-level", default="INFO")
@@ -405,7 +463,8 @@ def main() -> int:
         datefmt="%H:%M:%S",
     )
     cfg = load_config(args.config)
-    return run(cfg, dry_run=args.dry_run, port_override=args.serial)
+    return run(cfg, dry_run=args.dry_run, port_override=args.serial,
+               source=args.source)
 
 
 if __name__ == "__main__":

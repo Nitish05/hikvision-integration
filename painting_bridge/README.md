@@ -1,139 +1,301 @@
 # painting_bridge
 
-Real-time Cartesian streaming from the Teensy painting handle (BNO055 + 3×
-draw-wire trilateration) to a Fairino FR5 via `ServoJ` + `GetInverseKinRef`.
-The handle's 6-DOF pose drives the FR5 TCP at 100 Hz, anchored so the arm
-never jumps on startup.
+Real-time Cartesian streaming bridge for the Fairino FR5 painting rig.
 
-> For the operator-facing two-machine workflow (record on Linux with this
-> bridge, play back on Windows with `hikvision.py`) see [`../HANDOFF.md`](../HANDOFF.md).
-> For setup, network, and the full troubleshooting table see [`../README.md`](../README.md).
+The bridge can now use either input source:
+
+- **Teensy handle**: BNO055 + 3 draw-wire encoders over USB serial.
+- **Quest controller**: OpenVR pose stream from a Quest controller, using the same controller-coordinate convention as `quest.py`.
+
+Both sources feed the same servo loop. The bridge anchors the robot at its current TCP pose, treats the input device as a delta source, and sends `tcp_start + input_delta` through `ServoJ` + `GetInverseKinRef`.
+
+For the operator-facing two-machine workflow, see [`../HANDOFF.md`](../HANDOFF.md). For setup, network, hardware pinout, and broader troubleshooting, see [`../README.md`](../README.md).
 
 ## Layout
 
 | File | Role |
 |---|---|
-| `bridge.py` | Entry point. Orchestrates reader thread + servo loop + recorder hotkey. |
-| `teensy_reader.py` | Serial auto-detect + Teleplot parser (`>x:`, `>q*:`, `>button:`, `>rezero:`, `>trilatFail:`). |
-| `fr5_servo.py` | `fairino.Robot.RPC` wrapper + `MockRobot` for `--dry-run`. ServoJ path with `GetInverseKinRef` + fresh-joint retry. |
-| `quat.py` | Quaternion math (Hamilton product, Tait-Bryan ⇄ quat, axis-angle scaling). Used to compose handle→TCP rotations in the body frame. |
-| `safety.py` | EMA, per-axis delta clamp, workspace AABB + spherical reach gate. |
-| `recording.py` | `TrajectoryRecorder` daemon thread; writes `recorder.py`-compatible `.txt` from cached state reads. |
-| `config.yaml` | Tunables (scales, limits, filter alpha, recording period). |
-| `tests/test_safety.py` | Unit tests for pure-function safety primitives. |
-| `tests/test_recording.py` | Unit tests for the trajectory file writer (header + row formatting). |
+| `bridge.py` | Main entry point. Prompts for input source, starts the reader, runs the servo loop, handles recording and shutdown. |
+| `teensy_reader.py` | Serial auto-detect + Teleplot parser for the Teensy handle. Auto-detect works on Windows COM ports and Linux/macOS serial devices. |
+| `quest_reader.py` | OpenVR reader for Quest controller poses. Converts controller data to bridge `HandleSample` deltas. |
+| `fr5_servo.py` | `fairino.Robot.RPC` wrapper + `MockRobot` for `--dry-run`. Uses ServoJ with controller-side IK via `GetInverseKinRef`. |
+| `quat.py` | Quaternion math for bridge rotation composition and clamps. |
+| `safety.py` | Position EMA, workspace clamp, per-cycle delta clamp, reach gate, finite-value checks. |
+| `recording.py` | Background trajectory recorder. Writes recorder.py-compatible `.txt` files from cached robot state. |
+| `config.yaml` | Tunables for serial, Quest, robot, mapping, safety, filtering, solenoid, and recording. |
+| `tests/` | Unit tests for safety and recording helpers. |
 
 ## Install
 
-```
+Minimum bridge dependencies:
+
+```bash
 pip install pyserial pyyaml
 ```
-(Fairino SDK is already in `../fairino/`.)
 
-## Run
+Quest input also needs the OpenVR Python package and SteamVR/OpenVR running:
 
-### Dry-run (no robot, Mock only)
+```bash
+pip install openvr
 ```
+
+The Fairino SDK is already vendored in `../fairino/`; `fr5_servo.py` imports it from the repo root.
+
+## Running
+
+From the repo root on Windows:
+
+```powershell
+.\.venv\Scripts\python.exe .\painting_bridge\bridge.py --dry-run
+```
+
+From inside `painting_bridge/`:
+
+```powershell
+..\.venv\Scripts\python.exe .\bridge.py --dry-run
+```
+
+On Linux/macOS with the venv activated:
+
+```bash
+cd painting_bridge
 python bridge.py --dry-run
 ```
-Expect logs like `preflight OK`, `anchored`, and `sent=99 skipped=0 clamped=0`
-streaming at ~1 Hz. Wiggle the handle; clamps should fire on fast motion.
 
-### Live
-```
-python bridge.py
-```
-Robot IP is read from `config.yaml` (`robot.ip`, default `192.168.57.2` — the
-SDK's factory default is `192.168.58.2`, this rig is on the .57 subnet).
-Serial port is auto-detected by Teensy VID; override with `--serial /dev/ttyACM0`
-if needed.
+When `--source` is omitted, the bridge asks at runtime:
 
-### CLI flags
+```text
+Select control source:
+  1. Teensy handle
+  2. Quest controller
+Press Enter for Teensy.
+>
+```
+
+Accepted choices:
+
+- `Enter`, `1`, `t`, `teensy`
+- `2`, `q`, `quest`
+
+You can bypass the prompt:
+
+```bash
+python bridge.py --dry-run --source teensy
+python bridge.py --dry-run --source quest
+```
+
+Live robot mode is the same command without `--dry-run`:
+
+```bash
+python bridge.py --source teensy
+python bridge.py --source quest
+```
+
+## Source Behavior
+
+### Teensy Handle
+
+The Teensy firmware emits Teleplot-style serial keys:
+
+```text
+>x:...
+>y:...
+>z:...
+>qw:...
+>qx:...
+>qy:...
+>qz:...
+>button:0/1
+>rezero:1
+>trilatFail:N
+```
+
+`teensy_reader.py` publishes complete samples after it has received `x/y/z` and `qw/qx/qy/qz`. The pin-6 switch maps to the bridge button/solenoid state. A firmware rezero (`z` sent to the Teensy serial console) marks the next sample with `rezero=True`, causing the bridge to re-anchor without moving the robot.
+
+Serial auto-detect now uses PySerial `list_ports` first, so it works on:
+
+- Windows: `COM5`, `COM6`, etc.
+- Linux/macOS: `/dev/ttyACM0`, `/dev/cu.usbmodem...`, etc.
+- Linux stable fallback: `/dev/serial/by-id/*`
+
+Override auto-detect if needed:
+
+```bash
+python bridge.py --source teensy --serial COM5
+python bridge.py --source teensy --serial /dev/ttyACM0
+```
+
+### Quest Controller
+
+`quest_reader.py` reads OpenVR poses directly. SteamVR must be running, and the headset plus selected controller must be awake/tracked.
+
+Coordinate convention:
+
+- `+X`: right from the headset reference frame
+- `+Y`: away/forward from the headset reference frame
+- `+Z`: up
+
+Startup behavior:
+
+1. The first valid headset pose locks a headset reference frame.
+2. The first valid selected-controller pose becomes the controller anchor.
+3. The reader publishes controller deltas from that anchor, not raw Quest coordinates.
+4. The bridge adds those deltas to the robot TCP anchor, just like the Teensy source.
+
+This is important: the robot target is not `QuestXYZ`. It is:
+
+```text
+robot_target = robot_tcp_at_anchor + scale_xyz * (quest_controller_now - quest_controller_anchor)
+```
+
+Quest trigger maps to the bridge button/solenoid state.
+
+B/Y reset behavior:
+
+- Hold `B` or `Y`: Quest samples are marked not clean, so the bridge holds the robot.
+- Move while holding `B/Y`: the robot still does not move.
+- Release `B/Y`: the Quest controller anchor resets to the release pose, and the bridge re-anchors the robot TCP without a jump.
+
+Quest config:
+
+```yaml
+quest:
+  controller: right        # right, left, or first tracked controller
+  wait_timeout_s: 60.0     # time allowed for OpenVR to publish first poses
+```
+
+If startup is waiting on tracking, logs will say whether it is waiting for headset pose or controller pose.
+
+## CLI Flags
 
 | Flag | Default | Purpose |
 |---|---|---|
-| `--config <path>` | `painting_bridge/config.yaml` | Override config file |
-| `--serial <dev>` | (auto-detect) | Force a specific serial device |
-| `--dry-run` | off | Use `MockRobot` — no controller needed |
-| `--log-level` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
+| `--config <path>` | `painting_bridge/config.yaml` | Override config file. |
+| `--serial <dev>` | config `serial.port` | Force Teensy serial port. Ignored for Quest source. |
+| `--source teensy\|quest` | interactive prompt | Select input source without prompting. |
+| `--dry-run` | off | Use `MockRobot`; no physical FR5 connection or motion. Still uses the selected input source. |
+| `--log-level` | `INFO` | `DEBUG`, `INFO`, `WARNING`, or `ERROR`. |
 
-### Recording a trajectory (in-session)
+## Dry-Run
 
-While the bridge is running, press **`r` + Enter** in the terminal to start
-recording, **`r` + Enter** again to stop. Output lands at
-`recordings/run_YYYYMMDD_HHMMSS.txt` in `recorder.py`-compatible format
-(header + 15-field rows). The recorder is a daemon thread that samples
-cached state — it never touches the servo loop. See the format spec below.
+Dry-run replaces the physical robot with `MockRobot`. It is useful for checking:
 
-Files written here are designed to be played back from Windows via
-`.venv/hikvision.py` (see [`../HANDOFF.md`](../HANDOFF.md)). Do **not** run
-that GUI from Linux.
+- the selected source starts;
+- samples arrive;
+- anchoring and B/Y or Teensy rezero behavior work;
+- recorder hotkey behavior;
+- safety counters such as `clamped`, `hold`, and `skipped`.
 
-## Safety checklist — run through every session
+Dry-run does not model real FR5 kinematics. The mock IK is only a placeholder for exercising the bridge loop. A stick-figure visualizer was briefly prototyped and then removed; dry-run now logs only.
 
-1. Robot **E-stop within reach**.
-2. Arm in a pose with ≥150 mm clearance in every direction from fixtures.
-3. First live test: `config.yaml` → `scale_xyz: 0.1`, `workspace_box_mm: [50, 50, 50]`.
-4. Handle **stationary** when you start the bridge. On `ServoMoveStart` the
-   arm must not move — if it does, stop and investigate before proceeding.
-5. Nudge handle 10 mm in +X → arm should move 1 mm in base +X. If direction
-   is wrong, flip a sign in the firmware `ENC_SIGN[]` or add a mapping
-   rotation to a future config field.
-6. Press `z` on the Teensy (or send `'z'` over the serial monitor) to
-   re-anchor without moving the arm.
-7. Only then raise `scale_xyz` and widen the workspace box.
+Examples:
 
-## Safety invariants enforced by the code
+```bash
+python bridge.py --dry-run --source teensy
+python bridge.py --dry-run --source quest
+```
 
-- **No startup jump** — first `ServoJ` target equals the IK of the robot's
-  current TCP pose (delta = 0). See `bridge.py:run()` after `preflight()`.
-- **Bounded velocity** — per-cycle delta clamp in `safety.clamp_delta`.
-  Default `2.5` mm/cycle at 100 Hz = 250 mm/s ceiling
-  (`safety.max_delta_mm_per_cycle` in `config.yaml`); `1.25` deg/cycle = 125 deg/s.
-- **Hard workspace box** — `safety.clamp_workspace` AABB around the anchor
-  (`safety.workspace_box_mm`, default ±400 mm per axis) plus a spherical
-  reach gate (`safety.workspace_reach_radius_mm`, default 500 mm).
-- **Stream-loss watchdog** — if no Teensy sample in 50 ms, the loop holds
-  and treats recovery as a new anchor (no accumulated drift or jump).
-- **Trilat-fail gate** — requires 2 consecutive clean samples after any
-  trilateration failure before resuming motion.
-- **Quaternion rotation composition** — handle→TCP rotations are composed
-  as quaternions in the body frame at the TCP; Tait-Bryan angles are only
-  computed at the final `ServoJ` send. See `quat.py` and the trade-off
-  notes in `../README.md`.
-- **Joint-delta clamp before ServoJ** — the IK output is rejected if any
-  joint changes more than the configured limit per cycle (mitigates wrist
-  singularity / IK flips that would otherwise trip the controller's
-  "Shaft collision fault").
-- **IK fresh-joint retry** — on `GetInverseKinRef` failure the wrapper
-  retries once with a fresh `GetActualJointPosDegree()` seed before
-  giving up; counters `retry_ok` / `retry_fail` appear in the stats line.
-- **Graceful shutdown** — SIGINT/SIGTERM trigger `StopMotion` →
-  `ServoMoveEnd` → `SetDO(0, 0)` (paint valve off).
+## Recording
+
+While the bridge is running, press `r` then Enter in the same terminal:
+
+```text
+r Enter  -> start recording
+r Enter  -> stop recording
+```
+
+Files land in:
+
+```text
+painting_bridge/recordings/run_YYYYMMDD_HHMMSS.txt
+```
+
+The recorder samples cached robot state at `recording.period_s`. It does not command motion and does not block the servo loop.
+
+The file format is recorder.py-compatible:
+
+```text
+header: N,1,period_ms,tool,diconfig,doconfig
+rows:   j1,j2,j3,j4,j5,j6,x,y,z,rx,ry,rz,5,trigger,17
+```
+
+Recorded files are intended for Windows playback via `.venv/hikvision.py` or other known-safe TPD playback flow. Do not run the Linux playback GUI path on hardware.
+
+## Safety Invariants
+
+- **No startup jump**: the first robot target equals the current TCP pose.
+- **Input-as-delta**: Teensy and Quest sources are both treated as deltas from their source anchor.
+- **Re-anchor without motion**: Teensy `>rezero:1` and Quest B/Y release both refresh robot/input anchors before sending new motion.
+- **Bounded velocity**: position and rotation deltas are clamped per cycle.
+- **Workspace limits**: targets are clamped to the configured workspace box around `tcp_start`.
+- **Reach gate**: targets outside `workspace_reach_radius_mm` are held rather than sent to IK.
+- **Stream-loss watchdog**: stale input causes a hold and forces re-anchor on recovery.
+- **Clean-sample gate**: Teensy trilat failures and Quest B/Y hold both pause motion.
+- **Quaternion rotation path**: rotations are filtered/composed/clamped as quaternions until the final FR5 boundary.
+- **Graceful shutdown**: `Ctrl-C`/SIGTERM runs `StopMotion`, `ServoMoveEnd`, and solenoid off.
+
+## Stats Line
+
+The bridge logs a 1 Hz line:
+
+| Field | Meaning |
+|---|---|
+| `sent` | Number of robot commands successfully sent. |
+| `skipped` | Cycles missed because of stream-loss/stale data. |
+| `clamped` | Cycles where position or rotation target was limited by safety clamps. |
+| `ik_fail` | IK failures returned by the FR5 SDK wrapper. |
+| `hold` | Cycles where the bridge deliberately held position. |
+| `retry_ok` | IK failures rescued by retrying with fresh joint state. |
+| `retry_fail` | IK failures not rescued by retry. |
+| `target` | Last attempted Cartesian target `[x, y, z, rx, ry, rz]`. |
+
+`clamped` means the requested target was too far, too fast, or outside a configured rotation/workspace limit. Occasional clamps are normal during fast hand motion. Constant clamps mean the source scale or safety limits need attention.
+
+## Configuration
+
+Important keys in `config.yaml`:
+
+| Key | Meaning |
+|---|---|
+| `serial.port` | `auto` or explicit serial port. Auto now works on Windows COM ports and Linux/macOS. |
+| `quest.controller` | `right`, `left`, or `first tracked controller`. |
+| `quest.wait_timeout_s` | Startup wait for first clean Quest sample. |
+| `robot.ip` | FR5 controller IP. |
+| `robot.use_servoj` | Keep `true`; ServoJ + IK is the proven path. |
+| `robot.cmd_period_s` / `robot.loop_period_s` | Command and host loop period. Defaults target 100 Hz. |
+| `mapping.scale_xyz` | Input millimeters to robot TCP millimeters. |
+| `mapping.scale_rot` | Input rotation scale. Set `0` for translation-only testing. |
+| `filter.ema_alpha_xyz` | Position smoothing alpha. |
+| `filter.ema_alpha_rot` | Rotation slerp alpha. |
+| `safety.max_delta_mm_per_cycle` | Per-cycle position speed clamp. |
+| `safety.max_delta_deg_per_cycle` | Per-cycle rotation speed clamp. |
+| `safety.workspace_box_mm` | Axis-aligned box around robot anchor. |
+| `safety.workspace_rot_deg` | Rotation envelope around robot anchor. |
+| `safety.workspace_reach_radius_mm` | Spherical target reach gate. |
+| `safety.stream_timeout_ms` | Input silence watchdog. |
+| `solenoid.enabled` / `solenoid.do_id` | Button-to-DO behavior. |
+| `recording.enabled` / `recording.period_s` | Recorder hotkey and output cadence. |
 
 ## Troubleshooting
 
-| Symptom | Likely cause | Fix |
+| Symptom | Likely Cause | Fix |
 |---|---|---|
-| `No Teensy found` | Device not enumerated | `ls /dev/serial/by-id/`; plug in or `--serial` |
-| `no clean (trilat-OK) sample within 5 s` | Draw-wires slack / anchor geometry bad | Re-tension, re-verify `ANCHOR*` constants in `main.cpp` |
-| `ServoJ err=112` | IK solver couldn't reach the target (most common with `use_servoj: true`) | Non-fatal; bridge holds. Re-home to mid-range; set `scale_rot: 0`; check the `retry_ok`/`retry_fail` counters |
-| `ServoCart err=112` | Same as above, on the legacy `use_servoj: false` path | Switch to ServoJ in `config.yaml` (`use_servoj: true`) |
-| `"Shaft collision fault"` on the pendant | Joint-space jump (IK flip / wrist singularity) | Mitigated by the joint-delta clamp before ServoJ; re-home off the singularity, raise `scale_rot` only after translation is dialled in |
-| `err=-4` on every RPC | Network timeout / wrong route | `ping 192.168.57.2`; `ip route get 192.168.57.2` must go via the wired NIC |
-| Clamps firing constantly | Handle noisy or scale too high | Lower `scale_xyz`; raise `ema_alpha_xyz` toward 0.15 |
-| Arm drifts at rest | BNO055 yaw drift via rotation scale | Set `scale_rot: 0` for translation-only teleop |
-| Arm moves violently during **playback** | You are running `hikvision.py` from Linux | E-stop. Move playback to Windows. See [`../HANDOFF.md`](../HANDOFF.md). |
-
-## Firmware dependency
-
-`main.cpp` must emit `>rezero:1` inside `captureZero()` (added alongside
-this bridge). Without it, the bridge cannot distinguish a user-initiated
-rezero from a normal sample.
+| `No Teensy serial port found` | Teensy not enumerated or wrong cable | Check Device Manager / `ls /dev/serial/by-id`; pass `--serial` explicitly. |
+| `no sample from quest within ...` | SteamVR/OpenVR not publishing poses | Open SteamVR, wake headset/controllers, verify `quest.py` viewport works. |
+| `waiting for Quest headset pose from OpenVR` | Headset not tracked | Wake headset, confirm SteamVR tracking. |
+| `waiting for Quest controller pose from OpenVR` | Controller asleep or wrong selected hand | Wake controller; set `quest.controller: left`, `right`, or `first`. |
+| Robot target jumps far on Quest source | Quest anchor was not reset where expected | Hold B/Y, move to neutral, release B/Y to re-anchor. |
+| Reach gate warnings | Target outside `workspace_reach_radius_mm` from robot anchor | Re-anchor, reduce scale, or move robot to a more central pose. |
+| `clamped` constantly increasing | Input asks for too much motion or rotation | Lower `scale_xyz`/`scale_rot`, move slower, or adjust safety limits carefully. |
+| `ik_fail` climbing | Target unreachable or near joint limits | Re-home to mid-range; set `scale_rot: 0` for first tests. |
+| Arm drifts at rest | Rotation source drift or noisy input | Set `scale_rot: 0`; increase smoothing; re-anchor. |
+| Solenoid does not follow trigger | Wrong source button, `solenoid.enabled: false`, or DO wiring | Check logs for `solenoid -> ON/OFF`, verify `do_id`, test DO wiring. |
 
 ## Tests
 
-```
+```bash
+cd painting_bridge
+python -m py_compile bridge.py teensy_reader.py quest_reader.py
 cd tests && python test_safety.py
 cd tests && python test_recording.py
 ```
