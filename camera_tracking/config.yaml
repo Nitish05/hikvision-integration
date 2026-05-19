@@ -1,0 +1,28 @@
+camera:
+  device: auto          # "auto" = match "Arducam OV9281"; or e.g. /dev/video2
+  width: 1280
+  height: 800
+  fps: 120
+  fourcc: MJPG
+  manual_exposure: true # tracking: fix exposure to kill motion blur
+  exposure_time: 15     # v4l2 exposure_time_absolute units (1..5000)
+
+checkerboard:
+  cols: 8               # inner corners (where black squares meet)
+  rows: 6
+  square_mm: 22.83
+
+calibration:
+  path: calibration.npz # resolved relative to this config file
+  min_views: 200
+
+apriltag:
+  family: 36h11
+  detect_decimate: 2    # 1=detect at full 1280x800; 2=detect on half-res (~3x
+                        # faster, shorter range). solvePnP still uses full-res corners.
+  reference:
+    id: 0               # fixed tag, laid flat -- its frame IS the X/Y/Z control frame
+    size_mm: 162         # measured outer black-square edge of the printed tag
+  moving:
+    id: 1               # handheld tag, reported relative to the reference tag
+    size_mm: 30.31

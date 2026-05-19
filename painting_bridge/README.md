@@ -2,12 +2,13 @@
 
 Real-time Cartesian streaming bridge for the Fairino FR5 painting rig.
 
-The bridge can now use either input source:
+The bridge can use any of three input sources:
 
 - **Teensy handle**: BNO055 + 3 draw-wire encoders over USB serial.
 - **Quest controller**: OpenVR pose stream from a Quest controller, using the same controller-coordinate convention as `quest.py`.
+- **Camera (AprilTag)**: a handheld AprilTag tracked relative to a fixed reference tag (see `../camera_tracking/`).
 
-Both sources feed the same servo loop. The bridge anchors the robot at its current TCP pose, treats the input device as a delta source, and sends `tcp_start + input_delta` through `ServoJ` + `GetInverseKinRef`.
+All sources feed the same servo loop. The bridge anchors the robot at its current TCP pose, treats the input device as a delta source, and sends `tcp_start + input_delta` through `ServoJ` + `GetInverseKinRef`.
 
 For the operator-facing two-machine workflow, see [`../HANDOFF.md`](../HANDOFF.md). For setup, network, hardware pinout, and broader troubleshooting, see [`../README.md`](../README.md).
 
@@ -18,6 +19,7 @@ For the operator-facing two-machine workflow, see [`../HANDOFF.md`](../HANDOFF.m
 | `bridge.py` | Main entry point. Prompts for input source, starts the reader, runs the servo loop, handles recording and shutdown. |
 | `teensy_reader.py` | Serial auto-detect + Teleplot parser for the Teensy handle. Auto-detect works on Windows COM ports and Linux/macOS serial devices. |
 | `quest_reader.py` | OpenVR reader for Quest controller poses. Converts controller data to bridge `HandleSample` deltas. |
+| `camera_reader.py` | AprilTag reader. Tracks a handheld tag relative to a fixed reference tag (uses `../camera_tracking/`) and publishes `HandleSample`. |
 | `fr5_servo.py` | `fairino.Robot.RPC` wrapper + `MockRobot` for `--dry-run`. Uses ServoJ with controller-side IK via `GetInverseKinRef`. |
 | `quat.py` | Quaternion math for bridge rotation composition and clamps. |
 | `safety.py` | Position EMA, workspace clamp, per-cycle delta clamp, reach gate, finite-value checks. |
@@ -68,6 +70,7 @@ When `--source` is omitted, the bridge asks at runtime:
 Select control source:
   1. Teensy handle
   2. Quest controller
+  3. Camera (AprilTag)
 Press Enter for Teensy.
 >
 ```
@@ -76,12 +79,14 @@ Accepted choices:
 
 - `Enter`, `1`, `t`, `teensy`
 - `2`, `q`, `quest`
+- `3`, `c`, `camera`
 
 You can bypass the prompt:
 
 ```bash
 python bridge.py --dry-run --source teensy
 python bridge.py --dry-run --source quest
+python bridge.py --dry-run --source camera
 ```
 
 Live robot mode is the same command without `--dry-run`:
@@ -89,6 +94,7 @@ Live robot mode is the same command without `--dry-run`:
 ```bash
 python bridge.py --source teensy
 python bridge.py --source quest
+python bridge.py --source camera
 ```
 
 ## Source Behavior
@@ -166,13 +172,73 @@ quest:
 
 If startup is waiting on tracking, logs will say whether it is waiting for headset pose or controller pose.
 
+### Camera (AprilTag)
+
+`camera_reader.py` tracks a handheld **moving** AprilTag relative to a fixed
+**reference** AprilTag, using the calibration and detector in
+`../camera_tracking/`. Camera device, intrinsics, and the tag ids/sizes are
+read from `../camera_tracking/config.yaml` (pointed to by `camera.ct_config`).
+
+Coordinate convention — set by where the reference tag is placed:
+
+- `+X`: left/right     `+Y`: away from the operator     `+Z`: up
+
+Because the pose is tag-to-tag *relative*, it is invariant to camera position
+— the camera can be bumped or moved without disturbing the output.
+
+Setup, in order:
+
+1. Calibrate the camera and verify tracking with `camera_tracking/` first
+   (`calibrate.py`, then `apriltag_pose.py`).
+2. Lay the **reference tag flat, face up**, rotated so its `+X/+Y` line up with
+   the FR5 base `+X/+Y` (`+Z` is up for both). Confirm with `apriltag_pose.py`
+   that moving the tag along robot `+X` raises X — *before* connecting the robot.
+3. The robot target, as with the other sources:
+
+   ```text
+   robot_target = robot_tcp_at_anchor + scale_xyz * (moving_tag_now - moving_tag_anchor)
+   ```
+
+Re-anchor: there is no button. The reader emits a sample only when **both**
+tags are cleanly detected. Briefly **cover the moving tag** (> the
+`stream_timeout_ms` watchdog) — the bridge holds the robot and re-anchors when
+the tag reappears, without a jump. "Cover, reposition, uncover" is the rezero.
+
+The paint solenoid trigger is not yet wired for the camera source (`button`
+stays unset). Orientation direction reuses the bridge's Quest-tuned mirror
+correction — if the wrist turns the wrong way, that is the knob to revisit.
+
+A live preview window (both tags, axes, reference-frame X/Y/Z, and fps) pops up
+while the camera source runs; set `camera.preview: false` for a headless run.
+
+The raw `solvePnP` pose jitters frame to frame, so `CameraReader` runs it
+through a **One Euro filter** before publishing — an adaptive low-pass that
+smooths hard when the tag is still and opens up when it moves (so it kills
+jitter without adding lag during motion). Two knobs per channel: lower
+`min_cutoff` = more smoothing of a still tag; higher `beta` = less lag on fast
+motion. Position and rotation tune separately. Set `smoothing.enabled: false`
+to publish the raw pose.
+
+Camera config (in `painting_bridge/config.yaml`):
+
+```yaml
+camera:
+  ct_config: ../camera_tracking/config.yaml   # camera + tag settings
+  preview: true                               # live camera window with fps
+  smoothing:
+    enabled: true
+    dcutoff: 1.0                              # Hz, derivative cutoff
+    position: {min_cutoff: 1.0, beta: 0.05}   # mm channels
+    rotation: {min_cutoff: 1.5, beta: 0.20}   # quaternion channels
+```
+
 ## CLI Flags
 
 | Flag | Default | Purpose |
 |---|---|---|
 | `--config <path>` | `painting_bridge/config.yaml` | Override config file. |
-| `--serial <dev>` | config `serial.port` | Force Teensy serial port. Ignored for Quest source. |
-| `--source teensy\|quest` | interactive prompt | Select input source without prompting. |
+| `--serial <dev>` | config `serial.port` | Force Teensy serial port. Ignored for Quest/Camera sources. |
+| `--source teensy\|quest\|camera` | interactive prompt | Select input source without prompting. |
 | `--dry-run` | off | Use `MockRobot`; no physical FR5 connection or motion. Still uses the selected input source. |
 | `--log-level` | `INFO` | `DEBUG`, `INFO`, `WARNING`, or `ERROR`. |
 

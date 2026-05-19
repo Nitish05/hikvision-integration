@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import os
 import queue
 import signal
@@ -54,6 +55,7 @@ log = logging.getLogger("bridge")
 HERE = os.path.dirname(os.path.abspath(__file__))
 SOURCE_TEENSY = "teensy"
 SOURCE_QUEST = "quest"
+SOURCE_CAMERA = "camera"
 
 
 def load_config(path: str) -> dict:
@@ -101,6 +103,7 @@ def _choose_source(source: Optional[str]) -> str:
         print("Select control source:")
         print("  1. Teensy handle")
         print("  2. Quest controller")
+        print("  3. Camera (AprilTag)")
         print("Press Enter for Teensy.")
         print("> ", end="", flush=True)
         try:
@@ -111,7 +114,9 @@ def _choose_source(source: Optional[str]) -> str:
             return SOURCE_TEENSY
         if choice in ("2", "q", "quest"):
             return SOURCE_QUEST
-        print("Please choose 1 for Teensy or 2 for Quest.")
+        if choice in ("3", "c", "camera"):
+            return SOURCE_CAMERA
+        print("Please choose 1 for Teensy, 2 for Quest, or 3 for Camera.")
 
 
 def _start_reader(source: str, cfg: dict, port_override: Optional[str],
@@ -123,6 +128,16 @@ def _start_reader(source: str, cfg: dict, port_override: Optional[str],
             controller_role=cfg.get("quest", {}).get("controller", "right"),
         )
         log.info("using quest controller source")
+    elif source == SOURCE_CAMERA:
+        from camera_reader import CameraReader
+        cam_cfg = cfg.get("camera", {})
+        ct_config = cam_cfg.get("ct_config", "../camera_tracking/config.yaml")
+        ct_path = os.path.normpath(os.path.join(HERE, ct_config))
+        reader = CameraReader(out_q=sample_q, ct_config_path=ct_path,
+                              preview=bool(cam_cfg.get("preview", True)),
+                              smoothing=cam_cfg.get("smoothing", {}),
+                              swap_xy=bool(cam_cfg.get("swap_xy", False)))
+        log.info("using camera (AprilTag) source: %s", ct_path)
     else:
         port = resolve_port(port_override or cfg["serial"]["port"])
         log.info("using serial port: %s", port)
@@ -228,6 +243,17 @@ def run(cfg: dict, dry_run: bool, port_override: Optional[str],
             threading.Thread(
                 target=_stdin_reader, args=(tok_q,), daemon=True).start()
             log.info("recording ready — press 'r' + Enter to toggle")
+
+        # Camera reference-tag frame -> FR5 base frame alignment. The reference
+        # tag is rarely laid parallel to the base; this yaw-about-Z rotates BOTH
+        # the position delta and the rotation so a tag move/twist along a
+        # physical axis drives the TCP the same way. 0.0 = parallel = identity.
+        is_camera = source == SOURCE_CAMERA
+        cam_yaw_deg = float(cfg.get("camera", {}).get("ref_to_base_yaw_deg", 0.0)) \
+            if is_camera else 0.0
+        cos_yaw = math.cos(math.radians(cam_yaw_deg))
+        sin_yaw = math.sin(math.radians(cam_yaw_deg))
+        q_ref_to_base = quat_from_zyx_deg(0.0, 0.0, cam_yaw_deg)  # IDENTITY when 0
 
         last_target_pos = list(tcp_start[:3])
         last_target_q = q_tcp_anchor
@@ -337,26 +363,51 @@ def run(cfg: dict, dry_run: bool, port_override: Optional[str],
             filtered_q = quat_normalize(
                 quat_slerp(filtered_q, last_sample.q_rel, a_rot))
 
-            # Position target — base-frame XYZ offsets from anchor.
-            target_pos = [tcp_start[i]
-                          + scale_xyz * (filtered_pos[i] - handle_ref_pos[i])
-                          for i in range(3)]
+            # Position target — base-frame XYZ offsets from anchor. For the
+            # camera, rotate the reference-frame delta into the FR5 base frame
+            # first (yaw-about-Z; identity for Teensy/Quest).
+            dx = filtered_pos[0] - handle_ref_pos[0]
+            dy = filtered_pos[1] - handle_ref_pos[1]
+            dz = filtered_pos[2] - handle_ref_pos[2]
+            if is_camera:
+                dx, dy = (cos_yaw * dx - sin_yaw * dy,
+                          sin_yaw * dx + cos_yaw * dy)
+            target_pos = [tcp_start[0] + scale_xyz * dx,
+                          tcp_start[1] + scale_xyz * dy,
+                          tcp_start[2] + scale_xyz * dz]
 
-            # Rotation target — body-frame composition AT the TCP.
-            # q_handle_delta is the rotation the handle has done since anchor,
-            # expressed in handle body axes at anchor. We apply the (scaled)
-            # same rotation to the TCP body axes at anchor: q_target =
-            # q_tcp_anchor · scale(q_handle_delta). Implicit assumption: the
-            # operator's grip at anchor establishes handle-axes ↔ TCP-axes
-            # correspondence (twist handle around its long axis ↔ twist brush
-            # around its long axis, etc.).
-            q_handle_delta = quat_mul(quat_conj(q_handle_anchor), filtered_q)
-            # Invert rotation direction about handle X and Z (robot was mirroring
-            # operator twist/yaw); pitch about Y stays as-is.
-            q_handle_delta = (q_handle_delta[0], -q_handle_delta[1],
-                              q_handle_delta[2], -q_handle_delta[3])
-            q_handle_delta = quat_scale_angle(q_handle_delta, scale_rot)
-            q_target = quat_normalize(quat_mul(q_tcp_anchor, q_handle_delta))
+            # Rotation target.
+            if is_camera:
+                # Space-frame: rotation delta taken in the reference-tag frame,
+                # rotated into the FR5 base frame by the same yaw as position
+                # (q_base = q_C · q_delta · q_C⁻¹), then applied in the base
+                # frame. A twist about a physical axis drives the TCP about that
+                # same axis. No (w,-x,y,-z) flip — that flip is a Teensy/BNO055
+                # quirk.
+                q_delta_ref = quat_mul(filtered_q, quat_conj(q_handle_anchor))
+                q_handle_delta = quat_mul(
+                    quat_mul(q_ref_to_base, q_delta_ref),
+                    quat_conj(q_ref_to_base))
+                q_handle_delta = quat_scale_angle(q_handle_delta, scale_rot)
+                q_target = quat_normalize(
+                    quat_mul(q_handle_delta, q_tcp_anchor))
+            else:
+                # Body-frame composition AT the TCP (Teensy/Quest).
+                # q_handle_delta is the rotation the handle has done since
+                # anchor, expressed in handle body axes at anchor. We apply the
+                # (scaled) same rotation to the TCP body axes at anchor:
+                # q_target = q_tcp_anchor · scale(q_handle_delta). Implicit
+                # assumption: the operator's grip at anchor establishes
+                # handle-axes ↔ TCP-axes correspondence (twist handle around
+                # its long axis ↔ twist brush around its long axis, etc.).
+                q_handle_delta = quat_mul(quat_conj(q_handle_anchor), filtered_q)
+                # Invert rotation direction about handle X and Z (robot was
+                # mirroring operator twist/yaw); pitch about Y stays as-is.
+                q_handle_delta = (q_handle_delta[0], -q_handle_delta[1],
+                                  q_handle_delta[2], -q_handle_delta[3])
+                q_handle_delta = quat_scale_angle(q_handle_delta, scale_rot)
+                q_target = quat_normalize(
+                    quat_mul(q_tcp_anchor, q_handle_delta))
 
             # Clamps — position per-axis box + delta, rotation geodesic
             # box + delta. Quat clamps reject the ±180 seam aliasing that
@@ -449,7 +500,8 @@ def main() -> int:
     ap.add_argument("--config", default=os.path.join(HERE, "config.yaml"))
     ap.add_argument("--serial", default=None,
                     help="override serial port (default: config.yaml or auto)")
-    ap.add_argument("--source", choices=(SOURCE_TEENSY, SOURCE_QUEST),
+    ap.add_argument("--source",
+                    choices=(SOURCE_TEENSY, SOURCE_QUEST, SOURCE_CAMERA),
                     default=None,
                     help="control source; omit to choose at launch")
     ap.add_argument("--dry-run", action="store_true",
