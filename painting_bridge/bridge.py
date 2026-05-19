@@ -45,6 +45,7 @@ from quat import (
     quat_from_zyx_deg,
     quat_mul,
     quat_normalize,
+    quat_rotate_vec,
     quat_scale_angle,
     quat_slerp,
     quat_to_zyx_deg,
@@ -64,13 +65,21 @@ def load_config(path: str) -> dict:
 
 
 def _stdin_reader(q: "queue.Queue[str]") -> None:
-    """Blocking readline loop in a daemon thread. 'r' + Enter toggles the
-    recorder; 'q' + Enter is reserved for future shutdown hotkey. Silently
-    exits on EOF (non-TTY invocation like nohup/systemd)."""
+    """Keyboard-hotkey daemon thread. SPACE -> 'solenoid', 'r' -> 'toggle'
+    (recorder). run() puts the terminal in cbreak mode so keypresses register
+    without Enter; this thread just reads single chars. Exits on EOF/error."""
+    import select
+    fd = sys.stdin.fileno()
     try:
-        for line in sys.stdin:
-            tok = line.strip().lower()
-            if tok == "r":
+        while True:
+            if not select.select([fd], [], [], 0.2)[0]:
+                continue
+            ch = os.read(fd, 1)
+            if not ch:
+                break                       # EOF
+            if ch == b" ":
+                q.put("solenoid")
+            elif ch in (b"r", b"R"):
                 q.put("toggle")
     except Exception:
         pass
@@ -240,17 +249,49 @@ def run(cfg: dict, dry_run: bool, port_override: Optional[str],
                 filename_prefix=rec_cfg.get("filename_prefix", "run"),
                 tool=int(rec_cfg.get("tool", 0)),
             )
+        # Keyboard hotkeys (SPACE = solenoid, 'r' = recorder). Put the terminal
+        # in cbreak mode so keypresses register without Enter; restored in the
+        # finally below. Skipped cleanly on a non-TTY (nohup/systemd).
+        stdin_termios = None
+        hotkeys = []
+        if sol_enabled:
+            hotkeys.append("SPACE toggles solenoid")
+        if rec_enabled:
+            hotkeys.append("'r' toggles recorder")
+        if hotkeys:
+            if sys.stdin.isatty():
+                try:
+                    import termios
+                    import tty
+                    _fd = sys.stdin.fileno()
+                    stdin_termios = (_fd, termios.tcgetattr(_fd))
+                    tty.setcbreak(_fd)
+                except Exception as e:
+                    log.warning("could not set terminal cbreak mode: %s", e)
+                    stdin_termios = None
             threading.Thread(
                 target=_stdin_reader, args=(tok_q,), daemon=True).start()
-            log.info("recording ready — press 'r' + Enter to toggle")
+            log.info("hotkeys: %s", "  |  ".join(hotkeys))
 
-        # Camera reference-tag frame -> FR5 base frame alignment. The reference
-        # tag is rarely laid parallel to the base; this yaw-about-Z rotates BOTH
-        # the position delta and the rotation so a tag move/twist along a
-        # physical axis drives the TCP the same way. 0.0 = parallel = identity.
+        # Camera control frame. "tcp" maps tag X/Y/Z to the tool's own axes
+        # (frozen at the anchor); "base" maps them to the FR5 base frame, with
+        # ref_to_base_yaw_deg correcting how the reference tag is laid vs the
+        # base. Gated on the camera source; Teensy/Quest are unaffected.
+        cam_cfg = cfg.get("camera", {})
         is_camera = source == SOURCE_CAMERA
-        cam_yaw_deg = float(cfg.get("camera", {}).get("ref_to_base_yaw_deg", 0.0)) \
-            if is_camera else 0.0
+        control_frame = str(cam_cfg.get("control_frame", "base")).lower() \
+            if is_camera else "base"
+        use_tcp_frame = is_camera and control_frame == "tcp"
+        # Invert the Y / Z translation (e.g. tag laid flat, Z up, vs tool
+        # pointing down — lift the tag to raise the tool).
+        invert_y = is_camera and bool(cam_cfg.get("invert_y", False))
+        invert_z = is_camera and bool(cam_cfg.get("invert_z", False))
+        # Reverse the rotation direction about the Y / Z axis (twist sense).
+        invert_rot_y = is_camera and bool(cam_cfg.get("invert_rot_y", False))
+        invert_rot_z = is_camera and bool(cam_cfg.get("invert_rot_z", False))
+        # ref_to_base_yaw_deg only applies to base-frame mode.
+        cam_yaw_deg = float(cam_cfg.get("ref_to_base_yaw_deg", 0.0)) \
+            if (is_camera and not use_tcp_frame) else 0.0
         cos_yaw = math.cos(math.radians(cam_yaw_deg))
         sin_yaw = math.sin(math.radians(cam_yaw_deg))
         q_ref_to_base = quat_from_zyx_deg(0.0, 0.0, cam_yaw_deg)  # IDENTITY when 0
@@ -266,6 +307,7 @@ def run(cfg: dict, dry_run: bool, port_override: Optional[str],
         n_sent = n_skipped = n_clamped = n_ik_fail = n_hold = 0
         t_last_ik_warn = 0.0
         last_do_state: Optional[bool] = None      # edge tracker for solenoid
+        kbd_sol_state = False                     # spacebar-toggled solenoid request
         t_next = time.perf_counter() + cmd_period
         t_log = time.monotonic()
 
@@ -286,32 +328,37 @@ def run(cfg: dict, dry_run: bool, port_override: Optional[str],
             except queue.Empty:
                 pass
 
-            # Recorder hotkey: drain any pending 'r' toggles.
-            if recorder is not None:
-                try:
-                    while True:
-                        tok = tok_q.get_nowait()
-                        if tok == "toggle":
-                            if recorder.is_recording():
-                                recorder.stop()
-                            else:
-                                recorder.start()
-                except queue.Empty:
-                    pass
+            # Hotkeys: drain pending keypresses ('r' recorder, SPACE solenoid).
+            try:
+                while True:
+                    tok = tok_q.get_nowait()
+                    if tok == "toggle" and recorder is not None:
+                        if recorder.is_recording():
+                            recorder.stop()
+                        else:
+                            recorder.start()
+                    elif tok == "solenoid":
+                        kbd_sol_state = not kbd_sol_state
+                        log.info("spacebar: solenoid request -> %s",
+                                 "ON" if kbd_sol_state else "OFF")
+            except queue.Empty:
+                pass
 
-            # Solenoid — edge-triggered. Always-on gate: run before any of the
-            # motion hold paths so the valve tracks the switch even while the
-            # arm is paused for trilat/IK/watchdog recovery.
-            if sol_enabled and last_sample.button is not None \
-                    and last_sample.button != last_do_state:
-                err_do = servo.set_do(sol_do_id, 1 if last_sample.button else 0)
-                if err_do == 0:
-                    last_do_state = last_sample.button
-                    servo.last_do_state = bool(last_sample.button)
-                    log.info("solenoid -> %s", "ON" if last_sample.button else "OFF")
-                else:
-                    log.warning("SetDO err=%s (target=%s)", err_do,
-                                int(bool(last_sample.button)))
+            # Solenoid — edge-triggered on the OR of the physical switch
+            # (Teensy) and the spacebar toggle. Runs before the motion hold
+            # paths so the valve tracks the input even while the arm is paused
+            # for trilat/IK/watchdog recovery.
+            if sol_enabled:
+                sol_want = bool(last_sample.button) or kbd_sol_state
+                if sol_want != last_do_state:
+                    err_do = servo.set_do(sol_do_id, 1 if sol_want else 0)
+                    if err_do == 0:
+                        last_do_state = sol_want
+                        servo.last_do_state = sol_want
+                        log.info("solenoid -> %s", "ON" if sol_want else "OFF")
+                    else:
+                        log.warning("SetDO err=%s (target=%s)", err_do,
+                                    int(sol_want))
 
             # Stream-loss watchdog: hold position, treat next sample as new anchor.
             if time.monotonic() - last_sample.t_mono > stream_timeout_s:
@@ -363,13 +410,21 @@ def run(cfg: dict, dry_run: bool, port_override: Optional[str],
             filtered_q = quat_normalize(
                 quat_slerp(filtered_q, last_sample.q_rel, a_rot))
 
-            # Position target — base-frame XYZ offsets from anchor. For the
-            # camera, rotate the reference-frame delta into the FR5 base frame
-            # first (yaw-about-Z; identity for Teensy/Quest).
+            # Position target — XYZ offsets from the anchor pose.
             dx = filtered_pos[0] - handle_ref_pos[0]
             dy = filtered_pos[1] - handle_ref_pos[1]
             dz = filtered_pos[2] - handle_ref_pos[2]
-            if is_camera:
+            if invert_y:
+                dy = -dy
+            if invert_z:
+                dz = -dz
+            if use_tcp_frame:
+                # TCP-frame: treat the reference-frame delta as TCP-frame
+                # coords and rotate it by the TCP's anchor orientation — tag
+                # XYZ moves the tool along its own axes.
+                dx, dy, dz = quat_rotate_vec(q_tcp_anchor, (dx, dy, dz))
+            elif is_camera:
+                # Base-frame: yaw-about-Z aligns the reference tag to the base.
                 dx, dy = (cos_yaw * dx - sin_yaw * dy,
                           sin_yaw * dx + cos_yaw * dy)
             target_pos = [tcp_start[0] + scale_xyz * dx,
@@ -377,14 +432,34 @@ def run(cfg: dict, dry_run: bool, port_override: Optional[str],
                           tcp_start[2] + scale_xyz * dz]
 
             # Rotation target.
-            if is_camera:
-                # Space-frame: rotation delta taken in the reference-tag frame,
+            if use_tcp_frame:
+                # TCP-frame: space-frame rotation delta (reference axes)
+                # applied as a body-frame rotation at the TCP — a twist about a
+                # tag axis turns the tool about that same axis. Space-frame
+                # delta (filtered_q · q_anchor⁻¹), NOT the moving tag's
+                # body-frame delta — a handheld tag has no meaningful body
+                # frame.
+                q_delta_ref = quat_mul(filtered_q, quat_conj(q_handle_anchor))
+                if invert_rot_y or invert_rot_z:
+                    q_delta_ref = (
+                        q_delta_ref[0], q_delta_ref[1],
+                        -q_delta_ref[2] if invert_rot_y else q_delta_ref[2],
+                        -q_delta_ref[3] if invert_rot_z else q_delta_ref[3])
+                q_delta_ref = quat_scale_angle(q_delta_ref, scale_rot)
+                q_target = quat_normalize(
+                    quat_mul(q_tcp_anchor, q_delta_ref))
+            elif is_camera:
+                # Base-frame: rotation delta taken in the reference-tag frame,
                 # rotated into the FR5 base frame by the same yaw as position
                 # (q_base = q_C · q_delta · q_C⁻¹), then applied in the base
-                # frame. A twist about a physical axis drives the TCP about that
-                # same axis. No (w,-x,y,-z) flip — that flip is a Teensy/BNO055
+                # frame. No (w,-x,y,-z) flip — that flip is a Teensy/BNO055
                 # quirk.
                 q_delta_ref = quat_mul(filtered_q, quat_conj(q_handle_anchor))
+                if invert_rot_y or invert_rot_z:
+                    q_delta_ref = (
+                        q_delta_ref[0], q_delta_ref[1],
+                        -q_delta_ref[2] if invert_rot_y else q_delta_ref[2],
+                        -q_delta_ref[3] if invert_rot_z else q_delta_ref[3])
                 q_handle_delta = quat_mul(
                     quat_mul(q_ref_to_base, q_delta_ref),
                     quat_conj(q_ref_to_base))
@@ -469,6 +544,14 @@ def run(cfg: dict, dry_run: bool, port_override: Optional[str],
         log.exception("fatal: %s", e)
         exit_code = 1
     finally:
+        # Restore the terminal from cbreak mode (set when hotkeys are active).
+        try:
+            if 'stdin_termios' in locals() and stdin_termios is not None:
+                import termios
+                termios.tcsetattr(stdin_termios[0], termios.TCSADRAIN,
+                                  stdin_termios[1])
+        except Exception:
+            pass
         # Finalize recorder first so the file header's N is correct even if
         # the shutdown path raises below.
         try:

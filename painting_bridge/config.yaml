@@ -12,12 +12,20 @@ camera:
   # relative to this file. The moving tag is teleoped relative to the reference tag.
   ct_config: ../camera_tracking/config.yaml
   preview: true            # pop up a live camera window (tags, axes, fps)
+  control_frame: tcp       # base | tcp. tcp = tag X/Y/Z follow the tool's own
+                           # axes (frozen at anchor). base = tag axes -> FR5
+                           # base frame (uses ref_to_base_yaw_deg below).
+  invert_y: true           # negate the Y translation
+  invert_z: true           # negate the Z translation (tag laid flat Z-up vs
+                           # tool pointing down — lift the tag to raise the TCP)
+  invert_rot_y: true       # reverse the rotation direction about the Y axis
+  invert_rot_z: true       # reverse the rotation direction about the Z axis
   swap_xy: false           # swap the X and Y position axes (translation only);
                            # superseded by ref_to_base_yaw_deg — leave false
-  ref_to_base_yaw_deg: 0.0 # rotation from the reference-tag frame to the FR5
-                           # base frame, about Z (CCW positive). Tune so moving/
-                           # twisting the tag along a physical axis moves the TCP
-                           # the same way. 0 = tag laid parallel to the base.
+  ref_to_base_yaw_deg: 0.0 # base mode only — rotation from the reference-tag
+                           # frame to the FR5 base frame, about Z (CCW positive).
+                           # Tune so moving/twisting the tag along a physical
+                           # axis moves the TCP the same way. 0 = tag parallel.
   smoothing:               # One Euro jitter low-pass on the pose before the robot
     enabled: true
     dcutoff: 1.0           # Hz, derivative cutoff (rarely changed)

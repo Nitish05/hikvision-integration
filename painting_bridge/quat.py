@@ -33,6 +33,19 @@ def quat_conj(q: Sequence[float]) -> Quat:
     return (q[0], -q[1], -q[2], -q[3])
 
 
+def quat_rotate_vec(q: Sequence[float],
+                    v: Sequence[float]) -> Tuple[float, float, float]:
+    """Rotate 3-vector v by unit quaternion q (active rotation, q·v·q⁻¹)."""
+    w, x, y, z = q
+    vx, vy, vz = v
+    tx = 2.0 * (y * vz - z * vy)
+    ty = 2.0 * (z * vx - x * vz)
+    tz = 2.0 * (x * vy - y * vx)
+    return (vx + w * tx + (y * tz - z * ty),
+            vy + w * ty + (z * tx - x * tz),
+            vz + w * tz + (x * ty - y * tx))
+
+
 def quat_norm(q: Sequence[float]) -> float:
     return math.sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3])
 
