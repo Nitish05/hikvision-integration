@@ -273,6 +273,16 @@ def run(cfg: dict, dry_run: bool, port_override: Optional[str],
                 target=_stdin_reader, args=(tok_q,), daemon=True).start()
             log.info("hotkeys: %s", "  |  ".join(hotkeys))
 
+        # Optional USB HID keypad (e.g. QINIZX 2-key). Same tok_q as the
+        # stdin hotkeys — bridge ORs all solenoid sources together. Returns
+        # None and warns if disabled / evdev missing / device not found.
+        keypad_stop = threading.Event()
+        keypad_thread = None
+        if cfg.get("keypad", {}).get("enabled"):
+            from keypad_reader import start_keypad_reader
+            keypad_thread = start_keypad_reader(cfg["keypad"], tok_q,
+                                                keypad_stop)
+
         # Camera control frame. "tcp" maps tag X/Y/Z to the tool's own axes
         # (frozen at the anchor); "base" maps them to the FR5 base frame, with
         # ref_to_base_yaw_deg correcting how the reference tag is laid vs the
@@ -308,6 +318,7 @@ def run(cfg: dict, dry_run: bool, port_override: Optional[str],
         t_last_ik_warn = 0.0
         last_do_state: Optional[bool] = None      # edge tracker for solenoid
         kbd_sol_state = False                     # spacebar-toggled solenoid request
+        kbd_sol_momentary = False                 # keypad hold-to-spray request
         t_next = time.perf_counter() + cmd_period
         t_log = time.monotonic()
 
@@ -341,6 +352,10 @@ def run(cfg: dict, dry_run: bool, port_override: Optional[str],
                         kbd_sol_state = not kbd_sol_state
                         log.info("spacebar: solenoid request -> %s",
                                  "ON" if kbd_sol_state else "OFF")
+                    elif tok == "sol_press":
+                        kbd_sol_momentary = True
+                    elif tok == "sol_release":
+                        kbd_sol_momentary = False
             except queue.Empty:
                 pass
 
@@ -349,7 +364,8 @@ def run(cfg: dict, dry_run: bool, port_override: Optional[str],
             # paths so the valve tracks the input even while the arm is paused
             # for trilat/IK/watchdog recovery.
             if sol_enabled:
-                sol_want = bool(last_sample.button) or kbd_sol_state
+                sol_want = (bool(last_sample.button)
+                            or kbd_sol_state or kbd_sol_momentary)
                 if sol_want != last_do_state:
                     err_do = servo.set_do(sol_do_id, 1 if sol_want else 0)
                     if err_do == 0:
@@ -544,6 +560,14 @@ def run(cfg: dict, dry_run: bool, port_override: Optional[str],
         log.exception("fatal: %s", e)
         exit_code = 1
     finally:
+        # Stop the keypad reader (releases its grab() on the device).
+        try:
+            if 'keypad_stop' in locals():
+                keypad_stop.set()
+            if 'keypad_thread' in locals() and keypad_thread is not None:
+                keypad_thread.join(timeout=0.5)
+        except Exception:
+            pass
         # Restore the terminal from cbreak mode (set when hotkeys are active).
         try:
             if 'stdin_termios' in locals() and stdin_termios is not None:
