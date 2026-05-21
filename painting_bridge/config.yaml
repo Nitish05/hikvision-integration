@@ -41,7 +41,7 @@ robot:
   pos_gain: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
 
 mapping:
-  scale_xyz: 0.90          # 1:1 handle mm -> TCP mm
+  scale_xyz: 1.2          # 1:1 handle mm -> TCP mm
   scale_rot: 0.4      # 1:1 handle deg -> TCP deg
 
 safety:
@@ -62,23 +62,31 @@ solenoid:
   enabled: true           # false = ignore button events, solenoid never fires
   do_id: 0                # FR5 DO channel the solenoid is wired to (DO0)
 
-keypad:                   # optional USB HID macro keypad (e.g. QINIZX 2-key).
-                          # Linux-only (evdev). The camera/AprilTag source has
-                          # no physical trigger; this plugs that gap. Also
-                          # works alongside Teensy/Quest (OR'd in).
-  enabled: false          # flip to true after the device is plugged in
-  match_name: "QINIZX"    # substring match on evdev device name. Find yours:
-                          #   python -c "import evdev; [print(d.path, d.name) \
-                          #     for d in [evdev.InputDevice(p) \
-                          #       for p in evdev.list_devices()]]"
-  # vendor_id: 0x0c45     # optional: also require this USB VID
-  # product_id: 0x7403    # optional: also require this USB PID
+keypad:                   # USB HID macro keypad (QINIZX 2-key, both keys
+                          # remapped to KEY_SPACE in firmware). evdev grabs
+                          # the device so the spacebar fires the solenoid
+                          # WITHOUT needing the bridge terminal to be focused.
+                          # Linux-only.
+  enabled: true
+  # The QINIZX reports itself as "HID 8808:6601 ..." across 5 evdev nodes
+  # (keyboard, mouse, generic HID). VID:PID matching is more reliable than
+  # the generic name; the keypad reader will open ALL matching nodes that
+  # advertise the configured key code and listen to them in parallel.
+  match_name: null
+  vendor_id: 0x8808
+  product_id: 0x6601
   grab: true              # exclusive: keys do NOT leak into the focused window
-  solenoid_key: KEY_A     # change here OR remap in the QINIZX configurator;
-                          # confirm with `sudo evtest /dev/input/eventN`
-  recorder_key: KEY_B     # set null to ignore the second key
+                          # (so Ctrl+C from the keypad can't kill the bridge,
+                          #  and spacebar from the keypad doesn't double-fire
+                          #  with the stdin spacebar hotkey when terminal is
+                          #  focused)
+  solenoid_key: KEY_SPACE # both physical keys are remapped to spacebar in
+                          # firmware; either key fires the solenoid
+  recorder_key: KEY_SPACE # same code -> the elif in keypad_reader makes the
+                          # solenoid branch win; recorder is unreachable here
+                          # by design (no second free key)
   momentary: true         # true = hold-to-spray (paint-gun style)
-                          # false = press-to-toggle (same as spacebar)
+                          # false = press-to-toggle (same as stdin spacebar)
 
 recording:
   enabled: true           # enables the 'r' hotkey; false disables entirely

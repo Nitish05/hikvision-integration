@@ -613,8 +613,16 @@ def main() -> int:
                     help="control source; omit to choose at launch")
     ap.add_argument("--dry-run", action="store_true",
                     help="use MockRobot instead of connecting to an FR5")
+    ap.add_argument("--list-keypads", action="store_true",
+                    help="print all visible evdev devices (path, name, VID:PID, "
+                         "whether they expose KEY_SPACE) and exit. Use this "
+                         "to find the value for keypad.match_name.")
     ap.add_argument("--log-level", default="INFO")
     args = ap.parse_args()
+
+    if args.list_keypads:
+        from keypad_reader import list_devices_for_cli
+        return list_devices_for_cli()
 
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper()),
