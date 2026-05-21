@@ -239,6 +239,7 @@ camera:
 | `--config <path>` | `painting_bridge/config.yaml` | Override config file. |
 | `--serial <dev>` | config `serial.port` | Force Teensy serial port. Ignored for Quest/Camera sources. |
 | `--source teensy\|quest\|camera` | interactive prompt | Select input source without prompting. |
+| `--list-keypads` | off | Linux-only diagnostic. Print every visible evdev device (path, name, VID:PID, KEY_SPACE capability) and exit. Use this to set `keypad.match_name` or VID:PID when the default QINIZX `0x8808:0x6601` doesn't match. |
 | `--dry-run` | off | Use `MockRobot`; no physical FR5 connection or motion. Still uses the selected input source. |
 | `--log-level` | `INFO` | `DEBUG`, `INFO`, `WARNING`, or `ERROR`. |
 

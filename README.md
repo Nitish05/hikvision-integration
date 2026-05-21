@@ -10,6 +10,7 @@ Current bridge input sources:
 
 - **Teensy handle**: serial Teleplot stream from the physical painting handle.
 - **Quest controller**: OpenVR pose stream using `+X` right, `+Y` away from the headset reference, and `+Z` up. The Quest trigger maps to the paint/solenoid button. Holding `B` or `Y` pauses motion; releasing it re-anchors control from that release pose.
+- **Camera (AprilTag)**: a handheld moving AprilTag tracked relative to a fixed reference tag via a USB webcam. The pose is tag-to-tag relative, so the camera can be bumped without disturbing control. There is no built-in trigger button — paint via the **spacebar** hotkey or a USB keypad (both detailed under [Solenoid trigger](#solenoid-trigger)). Full rig setup is in [`camera_tracking/README.md`](camera_tracking/README.md).
 
 Both sources are treated as **input deltas**. The robot target is always based on the FR5 TCP pose captured at anchor time:
 
@@ -19,9 +20,21 @@ robot_target = robot_tcp_at_anchor + scale * input_delta_from_source_anchor
 
 ```
    ┌──────────────────────┐    USB     ┌───────────────┐  Ethernet   ┌─────────────┐
-   │ Teensy 4.1 handle    │───────────▶│ Host bridge   │────────────▶│ FR5 cobot   │
-   │ BNO055 + 3× encoders │   125 Hz   │ painting_     │   ~100 Hz   │ 192.168.57.2│
-   │ pin-6 switch         │  Teleplot  │ bridge/       │  ServoJ+IK  │ DO0 → valve │
+   │ Teensy 4.1 handle    │───────────▶│               │             │             │
+   │ BNO055 + 3× encoders │   125 Hz   │               │             │             │
+   │ pin-6 switch         │  Teleplot  │               │             │             │
+   └──────────────────────┘            │               │             │             │
+   ┌──────────────────────┐  OpenVR    │ Host bridge   │             │ FR5 cobot   │
+   │ Quest controller     │───────────▶│ painting_     │────────────▶│ 192.168.57.2│
+   │ pose + trigger + B/Y │            │ bridge/       │   ~100 Hz   │ DO0 → valve │
+   └──────────────────────┘            │               │  ServoJ+IK  │             │
+   ┌──────────────────────┐    USB     │               │             │             │
+   │ USB webcam +         │───────────▶│               │             │             │
+   │ AprilTags (ref+move) │            │               │             │             │
+   └──────────────────────┘            │               │             │             │
+   ┌──────────────────────┐  USB HID   │               │             │             │
+   │ USB keypad (QINIZX)  │───────────▶│  paint        │             │             │
+   │ paint trigger only   │   evdev    │  trigger OR   │             │             │
    └──────────────────────┘            └───────────────┘             └─────────────┘
 ```
 
@@ -33,10 +46,21 @@ hikvision_integration/
 ├── painting_firmware/          Teensy 4.1 handle firmware (PlatformIO)
 │   ├── platformio.ini
 │   └── src/main.cpp            IMU fusion, trilateration, button+rezero markers
+├── camera_tracking/            AprilTag camera rig (calibration + detector)
+│   ├── calibrate.py            Checkerboard intrinsic calibration
+│   ├── apriltag_pose.py        Standalone two-tag pose viewer (for setup)
+│   ├── tag_detector.py         AprilTag detection + solvePnP
+│   ├── camera.py               Camera capture (v4l2 auto-detect, threaded grab)
+│   └── config.yaml             Device, intrinsics path, tag ids/sizes
 ├── painting_bridge/            Real-time streaming bridge (live teleop + recorder)
 │   ├── bridge.py               Main entry point
 │   ├── teensy_reader.py        Serial parser
+│   ├── quest_reader.py         OpenVR / Quest controller input source
+│   ├── camera_reader.py        AprilTag camera input source (uses ../camera_tracking/)
+│   ├── keypad_reader.py        USB HID keypad paint-trigger (Linux-only, evdev)
+│   ├── one_euro.py             One Euro low-pass filter used by camera_reader.py
 │   ├── fr5_servo.py            FR5 SDK wrapper + MockRobot for --dry-run
+│   ├── quat.py                 Quaternion math for rotation composition / clamps
 │   ├── safety.py               EMA, delta clamp, workspace box, reach gate
 │   ├── recording.py            TrajectoryRecorder thread (recorder.py-compatible)
 │   ├── config.yaml             Tunables (scales, limits, filter alpha, recording)
@@ -45,14 +69,10 @@ hikvision_integration/
 ├── io_monitor.py               Real-time digital-I/O monitor GUI
 ├── lua_manager.py              Upload/run Lua scripts on the controller
 ├── di_do_passthrough.lua       Robot-side DI→DO mirror (10 ms loop)
+├── quest.py                    Standalone Quest/OpenVR viewport and coordinate debugger
 ├── requirements.txt            Python deps
 └── recordings/                 Bridge output (auto-created; gitignored)
 ```
-
-Additional current bridge files not shown in older diagrams:
-
-- `painting_bridge/quest_reader.py`: OpenVR / Quest controller input source for `bridge.py`.
-- `quest.py`: standalone Quest/OpenVR viewport and coordinate debugger.
 
 ---
 
@@ -257,6 +277,7 @@ When `--source` is omitted, `bridge.py` asks at runtime:
 Select control source:
   1. Teensy handle
   2. Quest controller
+  3. Camera (AprilTag)
 Press Enter for Teensy.
 >
 ```
@@ -266,7 +287,9 @@ You can also bypass the prompt:
 ```bash
 python bridge.py --source teensy
 python bridge.py --source quest
-python bridge.py --dry-run --source quest
+python bridge.py --source camera
+python bridge.py --dry-run --source camera
+python bridge.py --list-keypads      # Linux diagnostic: list evdev devices and exit
 ```
 
 Windows PowerShell examples:
@@ -274,6 +297,7 @@ Windows PowerShell examples:
 ```powershell
 .\.venv\Scripts\python.exe .\painting_bridge\bridge.py --dry-run
 .\.venv\Scripts\python.exe .\painting_bridge\bridge.py --dry-run --source quest
+.\.venv\Scripts\python.exe .\painting_bridge\bridge.py --dry-run --source camera
 ```
 
 **Pre-flight checklist:**
@@ -305,7 +329,21 @@ sent=99 skipped=0 clamped=0 ik_fail=0 hold=0 retry_ok=0 retry_fail=0 target=[...
 
 ### Solenoid trigger
 
-Press the handle's pin-6 switch or the Quest trigger -> `SetDO(0, 1)`. Release -> `SetDO(0, 0)`. Edge-triggered, not per-cycle. Valve closes automatically on `Ctrl-C`.
+The solenoid is driven by the **OR** of three independent sources — any one ON drives `DO0` ON:
+
+- **Teensy pin-6 switch** (handle source only): debounced edge from firmware.
+- **Stdin spacebar hotkey** (any source): the bridge puts the terminal in cbreak mode at startup so a single SPACE press toggles the solenoid request without needing Enter. The terminal must be focused. Restored on exit; skipped cleanly when stdin is not a TTY (`nohup`, systemd, piped). `r` in the same mode toggles the recorder.
+- **USB HID keypad** (Linux-only via `evdev`): a macro keypad whose key feeds the same solenoid request, momentary by default (hold-to-spray). Enabled by default in `config.yaml`; matches the QINIZX 2-key by VID:PID `0x8808:0x6601`. The reader `grab()`s the device exclusively so its keys do **not** leak into the focused window, which means it works without terminal focus — important for the camera source, which has no handle. On Windows or hosts without `evdev` the reader is a silent no-op.
+
+`SetDO(0, 1)` / `SetDO(0, 0)` is edge-triggered, not per-cycle. Valve closes automatically on `Ctrl-C`.
+
+Discover what device path/name to set as `keypad.match_name` (or to confirm the VID:PID match) by running:
+
+```bash
+python bridge.py --list-keypads
+```
+
+This prints every visible evdev device (path, name, VID:PID, KEY_SPACE capability) and exits.
 
 ### Re-anchoring mid-session
 
@@ -326,6 +364,26 @@ The Quest coordinate frame matches `quest.py`:
 The first valid headset pose locks the frame, and the first selected-controller pose becomes the controller anchor. The bridge receives only controller deltas from that anchor, then adds those deltas to the robot TCP anchor. It does not send raw Quest world coordinates to the robot.
 
 Quest trigger maps to the bridge button/solenoid. Holding `B` or `Y` pauses motion; moving the controller while held does not move the robot. Releasing `B` or `Y` re-anchors the controller and robot TCP at the release pose, so control resumes without a catch-up move.
+
+### Camera (AprilTag) source behavior
+
+Use `--source camera` or choose `3` from the startup menu. Requires a calibrated USB camera plus a printed and measured pair of AprilTags (one **reference**, laid flat; one **moving**, held in hand). Camera rig setup — checkerboard calibration, tag generation, tag-edge measurement, and reference-tag placement — lives in [`camera_tracking/README.md`](camera_tracking/README.md); the bridge reads camera device, intrinsics, and tag ids/sizes from `camera_tracking/config.yaml` (pointed to by `camera.ct_config`).
+
+Coordinate convention is set by where the reference tag is laid:
+
+| Axis | Meaning |
+|---|---|
+| `+X` | left/right along the reference tag |
+| `+Y` | away from the operator |
+| `+Z` | up (perpendicular to the tag) |
+
+Because the moving-tag pose is reported **relative to the reference tag**, it is invariant to where the camera sits. The camera can be bumped or moved between runs without disturbing the control mapping. Only the reference-tag placement matters.
+
+Re-anchor: the camera source has no button. Briefly cover the moving tag with your hand for longer than `safety.stream_timeout_ms` — the bridge holds the robot, and when the tag reappears both the moving-tag anchor and the robot TCP anchor refresh atomically. No catch-up jump. "Cover, reposition, uncover" is the rezero.
+
+Knobs live under `camera:` in `painting_bridge/config.yaml` — `control_frame` (`base` maps tag axes to the FR5 base via `ref_to_base_yaw_deg`; `tcp` maps them to the tool's own axes frozen at the anchor), `invert_y/invert_z/invert_rot_y/invert_rot_z` (per-axis sign), `ref_to_base_yaw_deg` (`base` mode only), One Euro smoothing per channel, and `preview` (live OpenCV window with both tags, axes, and fps). The full per-knob walkthrough is in [`painting_bridge/README.md`](painting_bridge/README.md#camera-apriltag).
+
+Paint trigger: the camera source has no handle button, so the [spacebar hotkey](#solenoid-trigger) (terminal-focused) or the USB keypad (hands-free) is the trigger.
 
 ### Shutdown
 
@@ -377,17 +435,27 @@ See **[painting_bridge/README.md](painting_bridge/README.md)** for in-depth brid
 
 ## Configuration reference (`painting_bridge/config.yaml`)
 
+> **Solenoid sources are OR'd**: Teensy pin-6 switch ∪ stdin spacebar toggle ∪ USB keypad. Any one ON drives `DO0` ON. The `solenoid.enabled` flag gates all three.
+
 | Key | Default | Notes |
 |---|---|---|
 | `serial.port` | `auto` | Auto-detects Teensy on Windows COM ports and Linux/macOS serial devices; explicit examples: `COM5`, `/dev/ttyACM0` |
 | `quest.controller` | `right` | Quest controller role: `right`, `left`, or `first` |
 | `quest.wait_timeout_s` | `60.0` | Startup wait for first clean Quest/OpenVR sample |
+| `camera.ct_config` | `../camera_tracking/config.yaml` | Path (relative to `painting_bridge/`) to the camera + tag settings file |
+| `camera.preview` | `true` | Live OpenCV preview window: both tags, axes, fps. Set `false` for headless runs |
+| `camera.control_frame` | `tcp` | `tcp` = tag X/Y/Z follow the tool's own axes (frozen at anchor); `base` = tag axes follow the FR5 base via `ref_to_base_yaw_deg` |
+| `camera.invert_y` / `invert_z` | `true` / `true` | Negate the Y / Z translation (tag laid flat Z-up vs tool pointing down — lift the tag to raise the TCP) |
+| `camera.invert_rot_y` / `invert_rot_z` | `true` / `true` | Reverse the rotation direction about each axis |
+| `camera.swap_xy` | `false` | Swap X / Y position axes; superseded by `ref_to_base_yaw_deg` — leave `false` |
+| `camera.ref_to_base_yaw_deg` | `0.0` | `base` mode only — yaw (about Z, CCW positive) from the reference-tag frame to the FR5 base. `0` = tag parallel to base |
+| `camera.smoothing.enabled` | `true` | One Euro low-pass on position + rotation. Set `false` to publish the raw `solvePnP` pose |
 | `robot.ip` | `192.168.57.2` | Override for different controllers |
 | `robot.use_servoj` | `true` | Use ServoJ+IK (proven); `false` reverts to ServoCart (hit err=112) |
 | `robot.cmd_period_s` | `0.010` | Declared cmdT; match loop_period_s |
 | `robot.loop_period_s` | `0.010` | Host servo loop target (100 Hz) |
-| `mapping.scale_xyz` | `1.0` | 1:1 handle mm → TCP mm |
-| `mapping.scale_rot` | `1.0` | Set to `0` for translation-only teleop (avoids wrist singularities) |
+| `mapping.scale_xyz` | `1.2` | Input mm → TCP mm. Bumped from `1.0` after camera-source tuning; lower if `clamped` is firing constantly |
+| `mapping.scale_rot` | `0.4` | Set to `0` for translation-only teleop (avoids wrist singularities) |
 | `safety.max_delta_mm_per_cycle` | `2.5` | 250 mm/s ceiling at 100 Hz |
 | `safety.max_delta_deg_per_cycle` | `1.25` | 125 deg/s ceiling at 100 Hz |
 | `safety.workspace_box_mm` | `[400, 400, 400]` | Axis-aligned cube (± per axis) around `tcp_start` |
@@ -396,8 +464,14 @@ See **[painting_bridge/README.md](painting_bridge/README.md)** for in-depth brid
 | `safety.stream_timeout_ms` | `50` | Reader-silence watchdog |
 | `safety.trilat_recover_samples` | `2` | Clean samples required after a trilat fail |
 | `filter.ema_alpha_xyz` | `0.35` | Lower = more smoothing / more lag |
-| `solenoid.enabled` | `true` | Disable to ignore button entirely |
+| `solenoid.enabled` | `true` | Master gate; `false` ignores all three trigger sources |
 | `solenoid.do_id` | `0` | FR5 DO channel |
+| `keypad.enabled` | `true` | Linux-only USB HID paint trigger. Silent no-op on Windows / hosts without `evdev` |
+| `keypad.match_name` | `null` | Optional substring match on evdev device name; VID:PID is preferred |
+| `keypad.vendor_id` / `product_id` | `0x8808` / `0x6601` | QINIZX 2-key default. Discover yours with `python bridge.py --list-keypads` |
+| `keypad.grab` | `true` | Exclusive grab so keys do **not** leak to the focused window |
+| `keypad.solenoid_key` / `recorder_key` | `KEY_SPACE` / `KEY_SPACE` | Both physical QINIZX keys are remapped to space in firmware; the solenoid branch wins for the shared code |
+| `keypad.momentary` | `true` | `true` = hold-to-spray (paint-gun style); `false` = press-to-toggle (same as stdin spacebar) |
 | `recording.enabled` | `true` | Disable `r` hotkey |
 | `recording.period_s` | `0.010` | 100 Hz; use `0.008` to match `recorder.py` CYCLETIME |
 
@@ -420,6 +494,11 @@ See **[painting_bridge/README.md](painting_bridge/README.md)** for in-depth brid
 | `trilatFail` increments | Draw-wires slack or anchors moved | Re-tension; re-verify `ANCHOR*` constants in `main.cpp` |
 | Sudden arm lunge after IK recovery | Operator moved handle during IK-hold, arm catches up at max velocity | See "Movement smoother after IK recovery" recommendation (re-anchor-on-resume pattern) |
 | Motion seems ~25 % slower than recording | Recorded at rate > playback ceiling | Keep `recording.period_s` at `0.010` for `recorder.py`'s `Play (Servo+DO)`; or use TPD for exact timing |
+| Camera source never anchors / `no AprilTag detected` | Tag occluded, lighting too low, wrong tag IDs/sizes, or missing calibration | Verify both tags detect with `camera_tracking/apriltag_pose.py`; re-check tag IDs/sizes in `camera_tracking/config.yaml`; recalibrate if intrinsics changed |
+| Camera axis is mirrored / arm goes the wrong way on one axis | `camera.invert_*` doesn't match the reference-tag placement (or `ref_to_base_yaw_deg` in `base` mode) | Twist the moving tag along each axis individually; flip the matching `invert_*`, or tune `ref_to_base_yaw_deg` |
+| Camera source jitters at rest | One Euro smoothing too open | Lower `camera.smoothing.position.min_cutoff`; raise `beta` only if motion lag becomes noticeable |
+| `keypad: no matching device found` | Wrong VID:PID, evdev not installed, or user not in `input` group | `pip install evdev`; `python bridge.py --list-keypads`; `sudo usermod -aG input $USER` then log out / log back in |
+| Spacebar hotkey does nothing | Terminal not focused, stdin not a TTY (piped/redirected, `nohup`, systemd) | Use the USB keypad instead — it doesn't need terminal focus |
 
 ---
 
