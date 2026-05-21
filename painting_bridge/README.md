@@ -20,6 +20,7 @@ For the operator-facing two-machine workflow, see [`../HANDOFF.md`](../HANDOFF.m
 | `teensy_reader.py` | Serial auto-detect + Teleplot parser for the Teensy handle. Auto-detect works on Windows COM ports and Linux/macOS serial devices. |
 | `quest_reader.py` | OpenVR reader for Quest controller poses. Converts controller data to bridge `HandleSample` deltas. |
 | `camera_reader.py` | AprilTag reader. Tracks a handheld tag relative to a fixed reference tag (uses `../camera_tracking/`) and publishes `HandleSample`. |
+| `windows_hotkey_reader.py` | Windows global Space listener. Space is hold-to-spray for the solenoid even when the terminal is not focused. |
 | `fr5_servo.py` | `fairino.Robot.RPC` wrapper + `MockRobot` for `--dry-run`. Uses ServoJ with controller-side IK via `GetInverseKinRef`. |
 | `quat.py` | Quaternion math for bridge rotation composition and clamps. |
 | `safety.py` | Position EMA, workspace clamp, per-cycle delta clamp, reach gate, finite-value checks. |
@@ -32,7 +33,8 @@ For the operator-facing two-machine workflow, see [`../HANDOFF.md`](../HANDOFF.m
 Minimum bridge dependencies:
 
 ```bash
-pip install pyserial pyyaml
+# From the repo root, not from painting_bridge/
+pip install -r requirements.txt
 ```
 
 Quest input also needs the OpenVR Python package and SteamVR/OpenVR running:
@@ -40,6 +42,11 @@ Quest input also needs the OpenVR Python package and SteamVR/OpenVR running:
 ```bash
 pip install openvr
 ```
+
+Windows camera support uses `pygrabber` to list DirectShow camera names and
+`pynput` for the global Space trigger; both are installed by `requirements.txt`
+on Windows. Linux keypad support uses `evdev`, installed by `requirements.txt`
+only on Linux.
 
 The Fairino SDK is already vendored in `../fairino/`; `fr5_servo.py` imports it from the repo root.
 
@@ -179,6 +186,23 @@ If startup is waiting on tracking, logs will say whether it is waiting for heads
 `../camera_tracking/`. Camera device, intrinsics, and the tag ids/sizes are
 read from `../camera_tracking/config.yaml` (pointed to by `camera.ct_config`).
 
+Camera auto-detect is platform-specific:
+
+- Linux: `camera.device: auto` matches the Arducam OV9281 through `v4l2-ctl`.
+- Windows: `camera.device: auto` lists DirectShow camera names and prefers
+  external-looking devices such as Arducam, Logitech, USB, or Webcam entries
+  over built-in Surface/Intel cameras. Set `camera.device: 2` (or another
+  index) to force a camera.
+
+Manual exposure is platform-specific too. Linux uses `exposure_time` in
+`v4l2-ctl` units. Windows uses DirectShow/OpenCV UVC values via
+`windows_auto_exposure` and `windows_exposure`; tune `windows_exposure` on the
+actual Arducam if the tags blur or the image is too dark.
+
+The camera open log is the source of truth. On Windows it prints all DirectShow
+devices and the chosen index, then the negotiated resolution/FPS. With the
+Arducam, keep `fourcc: MJPG` so high-FPS USB capture uses MJPEG.
+
 Coordinate convention — set by where the reference tag is placed:
 
 - `+X`: left/right     `+Y`: away from the operator     `+Z`: up
@@ -204,9 +228,11 @@ tags are cleanly detected. Briefly **cover the moving tag** (> the
 `stream_timeout_ms` watchdog) — the bridge holds the robot and re-anchors when
 the tag reappears, without a jump. "Cover, reposition, uncover" is the rezero.
 
-The paint solenoid trigger is not yet wired for the camera source (`button`
-stays unset). Orientation direction reuses the bridge's Quest-tuned mirror
-correction — if the wrist turns the wrong way, that is the knob to revisit.
+The camera source has no physical button (`button` stays unset), so use the
+keyboard trigger for paint. On Windows, global Space is hold-to-spray and works
+even when the bridge terminal is not focused. Orientation direction reuses the
+bridge's Quest-tuned mirror correction — if the wrist turns the wrong way, that
+is the knob to revisit.
 
 A live preview window (both tags, axes, reference-frame X/Y/Z, and fps) pops up
 while the camera source runs; set `camera.preview: false` for a headless run.
@@ -264,12 +290,17 @@ python bridge.py --dry-run --source quest
 
 ## Recording
 
-While the bridge is running, press `r` then Enter in the same terminal:
+While the bridge is running on Linux/macOS in a focused terminal, press `r` to
+start recording and press `r` again to stop:
 
 ```text
-r Enter  -> start recording
-r Enter  -> stop recording
+r  -> start recording
+r  -> stop recording
 ```
+
+The focused-terminal hotkey path is skipped on Windows; use Windows primarily
+for camera dry-runs/verification and the known-good playback GUI path unless a
+separate recorder trigger is added.
 
 Files land in:
 
@@ -325,6 +356,7 @@ Important keys in `config.yaml`:
 | Key | Meaning |
 |---|---|
 | `serial.port` | `auto` or explicit serial port. Auto now works on Windows COM ports and Linux/macOS. |
+| `camera_tracking.camera.device` | `auto`, Linux `/dev/videoN`, or Windows OpenCV camera index. Windows `auto` prefers external DirectShow camera names. |
 | `quest.controller` | `right`, `left`, or `first tracked controller`. |
 | `quest.wait_timeout_s` | Startup wait for first clean Quest sample. |
 | `robot.ip` | FR5 controller IP. |
@@ -340,7 +372,7 @@ Important keys in `config.yaml`:
 | `safety.workspace_rot_deg` | Rotation envelope around robot anchor. |
 | `safety.workspace_reach_radius_mm` | Spherical target reach gate. |
 | `safety.stream_timeout_ms` | Input silence watchdog. |
-| `solenoid.enabled` / `solenoid.do_id` | Button-to-DO behavior. |
+| `solenoid.enabled` / `solenoid.do_id` | Button-to-DO behavior. On Windows, global Space is hold-to-spray when enabled. |
 | `recording.enabled` / `recording.period_s` | Recorder hotkey and output cadence. |
 
 ## Troubleshooting
@@ -365,4 +397,5 @@ cd painting_bridge
 python -m py_compile bridge.py teensy_reader.py quest_reader.py
 cd tests && python test_safety.py
 cd tests && python test_recording.py
+cd tests && python test_windows_support.py
 ```

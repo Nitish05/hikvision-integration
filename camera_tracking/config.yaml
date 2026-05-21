@@ -1,11 +1,15 @@
 camera:
-  device: auto          # "auto" = match "Arducam OV9281"; or e.g. /dev/video2
+  device: auto          # Linux: "auto" matches "Arducam OV9281", or /dev/video2.
+                        # Windows: "auto" prefers external DirectShow camera
+                        # names, or set an index like 2 to force one.
   width: 1280
   height: 800
   fps: 120
   fourcc: MJPG
   manual_exposure: true # tracking: fix exposure to kill motion blur
   exposure_time: 15     # v4l2 exposure_time_absolute units (1..5000)
+  windows_auto_exposure: 0.25 # OpenCV/DirectShow manual-exposure mode
+  windows_exposure: -6        # Windows UVC exposure value; tune on the Arducam
 
 checkerboard:
   cols: 8               # inner corners (where black squares meet)

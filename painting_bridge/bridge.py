@@ -249,17 +249,27 @@ def run(cfg: dict, dry_run: bool, port_override: Optional[str],
                 filename_prefix=rec_cfg.get("filename_prefix", "run"),
                 tool=int(rec_cfg.get("tool", 0)),
             )
-        # Keyboard hotkeys (SPACE = solenoid, 'r' = recorder). Put the terminal
-        # in cbreak mode so keypresses register without Enter; restored in the
-        # finally below. Skipped cleanly on a non-TTY (nohup/systemd).
+        # Keyboard hotkeys. On Unix, focused-terminal SPACE toggles the
+        # solenoid. On Windows, pynput listens globally and SPACE is
+        # hold-to-spray even when the terminal is not focused.
         stdin_termios = None
+        windows_hotkey_listener = None
         hotkeys = []
         if sol_enabled:
-            hotkeys.append("SPACE toggles solenoid")
+            if sys.platform.startswith("win"):
+                hotkeys.append("global SPACE hold-to-spray")
+            else:
+                hotkeys.append("SPACE toggles solenoid")
         if rec_enabled:
             hotkeys.append("'r' toggles recorder")
+        if sol_enabled and sys.platform.startswith("win"):
+            try:
+                from windows_hotkey_reader import start_windows_hotkey_reader
+                windows_hotkey_listener = start_windows_hotkey_reader(tok_q)
+            except Exception as e:
+                log.warning("could not start Windows global hotkey listener: %s", e)
         if hotkeys:
-            if sys.stdin.isatty():
+            if sys.stdin.isatty() and not sys.platform.startswith("win"):
                 try:
                     import termios
                     import tty
@@ -566,6 +576,13 @@ def run(cfg: dict, dry_run: bool, port_override: Optional[str],
                 keypad_stop.set()
             if 'keypad_thread' in locals() and keypad_thread is not None:
                 keypad_thread.join(timeout=0.5)
+        except Exception:
+            pass
+        # Stop the Windows global keyboard listener if it was started.
+        try:
+            if 'windows_hotkey_listener' in locals() \
+                    and windows_hotkey_listener is not None:
+                windows_hotkey_listener.stop()
         except Exception:
             pass
         # Restore the terminal from cbreak mode (set when hotkeys are active).

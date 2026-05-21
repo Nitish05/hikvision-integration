@@ -8,7 +8,7 @@ Current bridge input sources:
 
 - **Teensy handle**: the original USB serial painting handle.
 - **Quest controller**: OpenVR controller pose source. Quest trigger maps to the paint button. Holding `B` or `Y` pauses motion; releasing it re-anchors control from that release pose.
-- **Camera (AprilTag)**: USB webcam tracking a handheld moving AprilTag relative to a fixed reference tag (camera-position-invariant). No built-in trigger — paint via the stdin **spacebar** hotkey or a USB HID keypad. Cold-start for the rig is in [`camera_tracking/README.md`](camera_tracking/README.md).
+- **Camera (AprilTag)**: USB camera tracking a handheld moving AprilTag relative to a fixed reference tag (camera-position-invariant). No built-in trigger. On Windows, global Space is hold-to-spray without terminal focus; on Linux, use focused-terminal Space or a USB HID keypad. Cold-start for the rig is in [`camera_tracking/README.md`](camera_tracking/README.md).
 
 The bridge asks for the source at runtime unless `--source teensy|quest|camera` is supplied.
 
@@ -26,7 +26,7 @@ The bridge asks for the source at runtime unless `--source teensy|quest|camera` 
   Quest controller    OpenVR │   bridge.py           ────────▶  192.168.57.2
   pose + trigger + B/Y ──────┼─▶ 100 Hz ServoJ + IK             DO0 → paint valve
                              │   'r' Enter → record
-  USB webcam +         USB   │     │
+  USB camera +         USB   │     │
   AprilTags (ref+move)──────┘      │
                                    ▼
   USB keypad (Linux,   evdev    paint trigger OR
@@ -59,6 +59,7 @@ The bridge asks for the source at runtime unless `--source teensy|quest|camera` 
 | Camera source | `painting_bridge/camera_reader.py` | AprilTag reader; publishes moving-tag-relative-to-reference-tag deltas as `HandleSample`, smoothed via One Euro |
 | Camera rig | `camera_tracking/` | `calibrate.py` (checkerboard intrinsics), `apriltag_pose.py` (standalone setup viewer), `tag_detector.py` (detection + solvePnP), `camera.py` (capture wrapper), `config.yaml` (tag ids/sizes, device, calibration path) |
 | Keypad source | `painting_bridge/keypad_reader.py` | Linux/evdev USB HID paint trigger; opens all matching nodes, filters by EV_KEY capability, grabs exclusively, multiplexes with `select` (per-fd unplug is handled gracefully) |
+| Windows Space source | `painting_bridge/windows_hotkey_reader.py` | Windows/pynput global Space listener; hold-to-spray even when the terminal is not focused |
 | One Euro filter | `painting_bridge/one_euro.py` | Adaptive low-pass used by `camera_reader.py` for jitter rejection without lag during motion |
 | Recordings output | `painting_bridge/recordings/run_YYYYMMDD_HHMMSS.txt` | Auto-created; gitignored |
 | Recording format spec | `painting_bridge/recording.py:33–47` | Header `N,1,period_ms,tool,diconfig,doconfig`; rows `j1..j6,x,y,z,rx,ry,rz,5,trigger,17` |
@@ -84,11 +85,10 @@ python3.12 -m venv .venv
 source .venv/bin/activate
 
 # 2. python deps
+python -m pip install --upgrade pip
 pip install -r requirements.txt
-pip install pyserial pyyaml
 pip install pygame openvr  # optional: Quest source / quest.py viewport on this host
-pip install evdev          # Linux only: USB HID keypad paint trigger
-# opencv-python and numpy are in requirements.txt — needed by the camera source
+# requirements.txt includes pyserial, opencv-python, numpy, pyyaml, and Linux evdev
 
 # 3. Fairino SDK — Option A (editable) or B (direct import from ./fairino, which
 #    is what bridge.py does by default). Option B is fine; Option A only if you
@@ -124,6 +124,18 @@ Print the AprilTags, measure each tag's outer black edge, set ids/sizes in `came
 
 Lay the **reference** tag flat with its `+X/+Y` aligned to the FR5 base. Full step-by-step (checkerboard cell size, expected RMS, tag placement gotchas) lives in [`camera_tracking/README.md`](camera_tracking/README.md) — don't restate it here.
 
+Camera device notes:
+
+- Linux `camera.device: auto` matches the Arducam OV9281 through `v4l2-ctl`.
+- Windows `camera.device: auto` lists DirectShow camera names through
+  `pygrabber` and prefers external-looking devices such as Arducam, OV9281,
+  USB, Webcam, Logitech, or C920 over built-in cameras. The startup log prints
+  the chosen index; set `camera.device` to that index only if you need to force
+  a device.
+- Keep `camera.fourcc: MJPG` for fast USB capture. On Windows, tune
+  `windows_exposure` on the real Arducam if tags blur or the image is too dark.
+  Placeholder webcam calibration is not valid for the Arducam.
+
 If `python3.12` is not installed, install Python 3.12 with your distro/package manager first. If you use `uv` on Linux instead, the equivalent self-contained setup is:
 
 ```bash
@@ -133,9 +145,10 @@ export UV_CACHE_DIR=.uv-cache
 export UV_PYTHON_INSTALL_DIR=.uv-python
 uv venv --managed-python --python 3.12 .venv
 source .venv/bin/activate
-uv pip install --python .venv/bin/python -r requirements.txt pyserial pyyaml pygame openvr
+uv pip install --python .venv/bin/python -r requirements.txt pygame openvr
 python -m ensurepip --upgrade
-python -c "import numpy, matplotlib, serial, yaml, pygame, openvr; print('imports ok')"
+python -c "import cv2, numpy, matplotlib, serial, yaml; print('core imports ok')"
+python -c "import pygame, openvr; print('quest imports ok')"  # only if Quest deps were installed
 python -m py_compile quest.py painting_bridge/bridge.py
 ```
 
@@ -163,7 +176,7 @@ pio device monitor        # confirm Teleplot stream: >x: >y: >z: >qw: ... >butto
 
 Confirm the handle enumerates as `/dev/serial/by-id/usb-Teensyduino_USB_Serial_*`.
 
-### Windows host (plays back trajectories only)
+### Windows host (plays back trajectories; optional camera setup/dry-runs)
 
 ```powershell
 # 1. clone + venv
@@ -173,9 +186,10 @@ py -3.12 -m venv .venv
 .venv\Scripts\activate
 
 # 2. python deps
+python -m pip install --upgrade pip
 pip install -r requirements.txt
-pip install pyserial pyyaml
 pip install pygame openvr # optional: Quest source / quest.py viewport on this host
+# requirements.txt includes Windows pynput (global Space) and pygrabber (DirectShow camera names)
 
 # 3. Fairino SDK — Option A is simpler on Windows because hikvision.py does
 #    `from fairino import Robot` unconditionally.
@@ -197,8 +211,9 @@ uv venv --managed-python --python 3.12 .venv
 .\.venv\Scripts\python.exe -m ensurepip --upgrade
 .\.venv\Scripts\activate
 
-uv pip install --python .venv\Scripts\python.exe -r requirements.txt pyserial pyyaml pygame openvr
-python -c "import numpy, matplotlib, serial, yaml, pygame, openvr; print('imports ok')"
+uv pip install --python .venv\Scripts\python.exe -r requirements.txt pygame openvr
+python -c "import cv2, numpy, matplotlib, serial, yaml, pynput, pygrabber; print('core imports ok')"
+python -c "import pygame, openvr; print('quest imports ok')"  # only if Quest deps were installed
 python -m py_compile quest.py painting_bridge\bridge.py
 ```
 
@@ -211,6 +226,54 @@ If uv reports cache or Python-install permission errors, keep these two environm
 - Static IPv4: `192.168.57.11`, mask `255.255.255.0`, **leave default gateway blank**.
 - Disable IPv6 on that adapter.
 - `ping 192.168.57.2` must succeed.
+
+PowerShell setup (run as Administrator). First list adapters and identify the
+Ethernet port plugged into the FR5:
+
+```powershell
+Get-NetAdapter | Format-Table Name, InterfaceDescription, Status, LinkSpeed
+```
+
+Then replace `Ethernet` below with the adapter `Name` from that table:
+
+```powershell
+$if = "Ethernet"
+Get-NetIPAddress -InterfaceAlias $if -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+  Format-Table InterfaceAlias, IPAddress, PrefixLength
+ping 192.168.57.2
+```
+
+If the adapter already has an address like `192.168.57.x` and the ping works,
+do not change anything. If it has no IPv4 address, a `169.254.x.x` address, or
+ping fails, configure the static robot subnet:
+
+```powershell
+$if = "Ethernet"
+
+# Remove old IPv4 addresses/routes on only this adapter.
+Get-NetIPAddress -InterfaceAlias $if -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+  Remove-NetIPAddress -Confirm:$false
+Get-NetRoute -InterfaceAlias $if -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+  Remove-NetRoute -Confirm:$false
+
+# Robot subnet. No DefaultGateway on purpose, so WiFi keeps internet access.
+New-NetIPAddress -InterfaceAlias $if -IPAddress 192.168.57.11 -PrefixLength 24
+Set-NetIPInterface -InterfaceAlias $if -Dhcp Disabled
+Disable-NetAdapterBinding -Name $if -ComponentID ms_tcpip6
+
+ping 192.168.57.2
+Test-NetConnection 192.168.57.2 -Port 20003
+```
+
+If internet stops working after this, the adapter probably has a gateway route.
+Check with:
+
+```powershell
+Get-NetRoute -InterfaceAlias $if -AddressFamily IPv4
+```
+
+There should be a route for `192.168.57.0/24`, but no `0.0.0.0/0` default route
+on the FR5 Ethernet adapter.
 
 ---
 
@@ -286,12 +349,13 @@ press   r   (no Enter)      → recorder starts
 press   r   (no Enter)      → recorder stops
 ```
 
-The bridge sets the terminal to cbreak at startup, so `r` and SPACE register as single keypresses (no Enter). Restored on `Ctrl-C` / exit. On a non-TTY (piped, `nohup`, systemd), cbreak is skipped cleanly and the stdin hotkeys are unavailable — use the USB keypad instead.
+On Linux/macOS, the bridge sets the terminal to cbreak at startup, so `r` and SPACE register as single keypresses (no Enter). Restored on `Ctrl-C` / exit. On a non-TTY (piped, `nohup`, systemd), cbreak is skipped cleanly and the stdin hotkeys are unavailable — use the USB keypad instead. On Windows, global Space is available for paint, but the recorder `r` hotkey is not global; keep production recording on the Linux host unless that path is extended.
 
 **Solenoid trigger sources** (OR'd — any one ON drives `DO0` ON):
 
 - Teensy pin-6 switch (handle source only).
-- Stdin SPACE toggle — requires the bridge terminal to be focused.
+- Linux/macOS stdin SPACE toggle — requires the bridge terminal to be focused.
+- Windows global SPACE — hold-to-spray through `pynput`, works even when the terminal is not focused. Events are not suppressed, so the focused app still receives normal Space input.
 - USB HID keypad (Linux, `evdev`) — `grab()`'d exclusively, so it fires the solenoid without needing the bridge terminal to be focused. Works alongside the other two; OR'd in. Critical for the camera source, which has no handle button.
 
 If the keypad isn't responding, run `python bridge.py --list-keypads` to confirm it's visible and that you're in the `input` group.
@@ -395,9 +459,13 @@ Raise these only after you've confirmed the handle/Quest/tag → arm direction i
 | `hikvision.py` errors on Load with `Trajectory file ... uploaded` followed by RPC error | Filename has spaces or path separators the controller rejects | Rename to `run_YYYYMMDD_HHMMSS.txt` style (no spaces, no subdirs) |
 | `err=-4` from RPC on Windows | Routing / firewall — controller unreachable | `ping 192.168.57.2`; disable Windows Firewall on the wired profile or whitelist the Fairino ports |
 | Camera source never anchors / `no AprilTag detected` | Lighting, occlusion, wrong tag IDs/sizes, or missing calibration | Verify with `camera_tracking/apriltag_pose.py` standalone; re-check tag IDs/sizes in `camera_tracking/config.yaml`; recalibrate if the lens/focus changed |
+| `calibration.npz not found` on camera bridge startup | Intrinsic calibration has not been run for that camera/resolution | Run `camera_tracking/calibrate.py` first; placeholder webcam calibration is not valid for the Arducam |
+| Windows picks the built-in camera | DirectShow order/name did not identify the external camera, or config forces the wrong index | Keep `camera.device: auto` and read the `DirectShow devices:` startup log; set `camera.device` to the printed Arducam/USB index only if needed |
+| Arducam tags blur on Windows | Exposure too long or lighting too low | Tune `camera_tracking/config.yaml` `windows_exposure` (`-6` start, more negative for shorter exposure) and add light |
 | Camera-source axis mirrored | `camera.invert_*` or `ref_to_base_yaw_deg` doesn't match the physical reference-tag placement | Twist the moving tag along each base axis individually; flip the matching `invert_*`, or in `control_frame: base` tune `ref_to_base_yaw_deg` |
 | Keypad does nothing | Disabled in config; user not in `input` group; wrong VID:PID; `evdev` missing | `pip install evdev`; `sudo usermod -aG input $USER` (log out/in); `python bridge.py --list-keypads`; set `keypad.match_name` or override VID:PID |
-| Spacebar hotkey does nothing | Terminal not focused; stdin not a TTY (`nohup`, systemd, piped, some IDE shells) | Use the USB keypad instead — it doesn't need terminal focus |
+| Spacebar hotkey does nothing on Linux/macOS | Terminal not focused; stdin not a TTY (`nohup`, systemd, piped, some IDE shells) | Focus the terminal or use the Linux USB keypad |
+| Spacebar hotkey does nothing on Windows | `pynput` missing or blocked | `pip install -r requirements.txt`; check for `Windows global SPACE hotkey enabled` in the bridge log |
 
 ---
 
@@ -410,9 +478,18 @@ source .venv/bin/activate
 cd painting_bridge
 python bridge.py
 # choose source from menu, or pass --source teensy / --source quest / --source camera
-# SPACE toggles solenoid (terminal-focused); USB keypad triggers it hands-free
+# SPACE toggles solenoid on Linux/macOS when terminal-focused; USB keypad triggers it hands-free
 # 'r' starts/stops recording, Ctrl-C to exit
 # python bridge.py --list-keypads     # Linux diagnostic: list evdev devices
+```
+
+**Camera dry-run / setup check (Windows):**
+
+```powershell
+.\.venv\Scripts\python.exe .\camera_tracking\calibrate.py
+.\.venv\Scripts\python.exe .\camera_tracking\apriltag_pose.py
+.\.venv\Scripts\python.exe .\painting_bridge\bridge.py --dry-run --source camera
+# global Space is hold-to-spray when solenoid.enabled is true
 ```
 
 **Transfer:**
@@ -440,6 +517,7 @@ python .venv\hikvision.py
 - `painting_bridge/quest_reader.py` — Quest/OpenVR source for bridge teleop
 - `painting_bridge/camera_reader.py` — AprilTag camera source for bridge teleop
 - `painting_bridge/keypad_reader.py` — USB HID keypad paint trigger (Linux-only, evdev)
+- `painting_bridge/windows_hotkey_reader.py` — Windows global Space hold-to-spray trigger
 - `painting_bridge/one_euro.py` — One Euro low-pass filter used by the camera source
 - `painting_bridge/teensy_reader.py` — Teensy serial source with Windows/Linux auto-detect
 - `painting_bridge/config.yaml` — all tunables (including `camera:` and `keypad:` blocks)
